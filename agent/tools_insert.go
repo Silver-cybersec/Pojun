@@ -732,6 +732,8 @@ func (t *ToolSet) WorkerTools() []actool.CoreTool {
 		// search_vulns / get_vuln：worker 识别出目标组件与版本后直接查已知漏洞与
 		// 影响区间——公开情报优先于模型现想 payload。
 		t.searchVulns(), t.getVuln(), t.getPoc(), t.scanWithNuclei(), t.netContext(),
+		// search_experience（v0.4.103）：按关键词/维度查本任务终态经验与跨任务成功 playbook。
+		t.searchExperience(),
 		// listener_*：回连接收器（红队 C2 前置）——start/stop 走 ask 审批，sessions 只读。
 		t.listenerStart(), t.listenerStop(), t.listenerSessions(),
 		// http_probe（v0.4.27）：批量探活领域工具——替代逐条手写 curl（任务 5 实测
@@ -740,10 +742,18 @@ func (t *ToolSet) WorkerTools() []actool.CoreTool {
 		// js_audit（v0.4.59）：SPA/webpack 前端源码泄露审计——任务 18（Vue 站点）
 		// 实测对 .js.map 泄漏完全漏检；sourcemap 还原=原始源码+密钥+接口清单。
 		t.jsAudit(),
+		// miniapp_audit（v0.4.99）：微信小程序解包产物目录审计——接口/密钥/云环境/
+		// 签名候选/路由/sourceMap/OSV。与 js_audit 共用内嵌 Python 的 --dir 分支。
+		t.miniappAudit(),
 		// auth_request：用资产上已登记的凭据组装带认证的请求（横向/越权验证的前提）。
 		t.authRequest(),
 		// evidence_check（v0.4.71）：复核高/危漏洞证据是否足以支撑危害结论（13 项检查 + src_ready）。
 		t.evidenceCheck(),
+		// validate_finding（v0.4.92）：按类别跑程序化验证探针（XBOW validators 范式），
+		// 输出机验标记 validate:<token>:pass 引用进 evidence 完成机验闭环。
+		t.validateFinding(),
+		// read_output（v0.4.92）：SDK 超长输出落盘文件的按行窗口回读（省 token）。
+		t.readOutput(),
 		// 原生 HTTP 执行器 + 会话复用（红队版 v0.7.0 下放）：直接发请求拿结构化结果，
 		// 登录态进任务级 cookie jar 跨意图复用——「登录→越权→回读」成为基本能力。
 		t.httpRequest(), t.sessionLogin(),
@@ -785,6 +795,8 @@ func (t *ToolSet) MainAgentTools() []actool.CoreTool {
 		// asset management (handlers guard nil store internally)
 		t.insertAssets(), t.addCompanyScope(), t.listAssets(),
 		t.addFinding(), t.recordFact(),
+		// audit_finding（v0.4.102）：独立只读复核 finding 证据，不依赖产出它的 worker。
+		t.auditFindingTool(),
 		t.addTaskScope(),
 		// list_untested_assets：按需查本任务范围内未测资产(类型+分页)，自行决定补测。
 		t.listUntestedAssets(),
@@ -799,11 +811,13 @@ func (t *ToolSet) MainAgentTools() []actool.CoreTool {
 		// auth_request：用资产上已登记的凭据组装带认证的请求（横向/越权验证的前提）。
 		t.authRequest(),
 		t.httpRequest(), t.sessionLogin(),
-		t.diffResponses(), t.diffResponses(),
+		t.diffResponses(),
 		// api_contract：读目标暴露的 API 契约文件，拿到比爬虫更准的接口清单。
 		t.apiContractTool(),
 		// search_recent_critical：按【时间】查最近披露的高危漏洞（不需先知道组件名/CVE 号）。
 		t.searchRecentCritical(),
+		// search_experience（v0.4.103）：按需检索终态经验与跨任务 playbook。
+		t.searchExperience(),
 	}
 }
 

@@ -24,8 +24,15 @@ func testDir(t *testing.T) string {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		time.Sleep(200 * time.Millisecond) // 让异步写手退场
-		_ = os.RemoveAll(dir)              // best-effort
+		// 30 秒退避重试：异步写手 + 上万个小文件的模板树，单次 RemoveAll 往往删不干净。
+		var last error
+		for i := 0; i < 120; i++ {
+			if last = os.RemoveAll(dir); last == nil {
+				return
+			}
+			time.Sleep(250 * time.Millisecond)
+		}
+		t.Logf("cleanup temp dir %s: %v", dir, last) // best-effort，但不再静默
 	})
 	return dir
 }

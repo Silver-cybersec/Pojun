@@ -19,8 +19,8 @@ import (
 
 // validLLMProfileFormats 与 llm_profiles_format_check 一致。
 var validLLMProfileFormats = map[string]bool{
-	"openai":          true,
-	"anthropic":       true,
+	"openai":           true,
+	"anthropic":        true,
 	"openai-responses": true,
 }
 

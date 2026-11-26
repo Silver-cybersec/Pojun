@@ -384,6 +384,23 @@ func (m *Manager) writeConfig(yamlText string, port int, opts StartOptions) (str
 	delete(cfg, "listeners")
 	cfg["geodata-mode"] = false
 	cfg["geo-auto-update"] = false
+
+	// mihomo 专有语法:dns.nameserver-policy 里 "rule-set:<name>"/"geosite:<name>" 键
+	// 引用 rule-providers/GEOSITE;上面已删 rule-providers 并收敛 rules,残留引用
+	// 会让 mihomo 启动即 fatal(not found rule-set: X)。清理这些引用键。
+	if d, ok := cfg["dns"].(map[string]any); ok {
+		if np, ok := d["nameserver-policy"].(map[string]any); ok {
+			for k := range np {
+				if strings.HasPrefix(k, "rule-set:") || strings.HasPrefix(k, "geosite:") {
+					delete(np, k)
+				}
+			}
+			if len(np) == 0 {
+				delete(d, "nameserver-policy")
+			}
+		}
+	}
+
 	cfg["mode"] = "rule"
 	outbound, err := applyOutboundPlan(cfg, opts)
 	if err != nil {

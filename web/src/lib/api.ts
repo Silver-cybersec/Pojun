@@ -13,6 +13,9 @@ import type {
   Activity,
   Agent,
   AgentDetail,
+  AgentLLMRoute,
+  AgentEffortOverrides,
+  AgentPromptChain,
   AgentTrigger,
   ArchiveBatchItem,
   Asset,
@@ -46,6 +49,8 @@ import type {
   FindingStats,
   FindingStatus,
   FindingsPage,
+  FindingRegressionCheck,
+  FindingRegressionResponse,
   FindingTraffic,
   FindingTrafficDetail,
   HostenvStatus,
@@ -80,7 +85,13 @@ import type {
   PromptVersion,
   SessionTokenUsage,
   Settings,
+  LLMPreset,
+  LLMModelMeta,
+  LLMCheckResult,
   AuthCheckResult,
+  TaskCredential,
+  TaskCredentialCheck,
+  TaskCredentialInput,
   TaskAuthConfigInput,
   TaskArtifact,
   TaskCostEstimate,
@@ -97,8 +108,11 @@ import type {
   TaskAssetScopeMutation,
   TaskCategory,
   TaskConstraint,
+  TaskEgressResponse,
+  ProgramProfile,
   TaskGoal,
   TaskLLMResolutions,
+  TaskProgramProfileResponse,
   TaskNode,
   TaskScopeRow,
   TaskTemplate,
@@ -111,6 +125,8 @@ import type {
   TrafficEvidenceRole,
   TrafficHost,
   TrafficResp,
+  TrafficRetentionResult,
+  TrafficRetentionStatus,
   ProxyPoolState,
   LocalProxyCandidate,
   MihomoStatus,
@@ -223,7 +239,11 @@ export function sseUrl(path: string): string {
   const base =
     process.env.NEXT_PUBLIC_SSE_BASE ??
     (process.env.NODE_ENV !== "production" && typeof window !== "undefined"
-      ? `${window.location.protocol}//${window.location.hostname}:8787`
+      ? // 后端默认只绑 IPv4 loopback：dev 下把 localhost 映射到 127.0.0.1，
+        // 避免 EventSource 走 ::1 连接被拒。生产保持同源。
+        `${window.location.protocol}//${
+          window.location.hostname === "localhost" ? "127.0.0.1" : window.location.hostname
+        }:8787`
       : "");
   const token = getToken();
   const sep = path.includes("?") ? "&" : "?";
@@ -320,6 +340,8 @@ export const api = {
   tasks: () =>
     get<{ tasks: Task[]; active: string }>("/tasks").then((r) => ({ tasks: arr(r.tasks), active: r.active ?? "" })),
   task: (id: string) => get<Task>(`/tasks/${encodeURIComponent(id)}`),
+  // 任务出口回执（issue #39）：构建时只读快照，非实时值。
+  taskEgress: (id: string) => get<TaskEgressResponse>(`/tasks/${encodeURIComponent(id)}/egress`),
   createTask: (input: {
     name?: string;
     categoryId?: number;
@@ -436,6 +458,11 @@ export const api = {
       request_id: string;
     }>(`/tasks/${taskId}/intents/${intentId}/messages`, { message, request_id: requestId }),
   taskLLMResolution: (id: string) => get<TaskLLMResolutions>(`/tasks/${id}/llm/resolution`),
+  taskProgramProfile: (id: string) =>
+    get<TaskProgramProfileResponse>(`/tasks/${encodeURIComponent(id)}/program-profile`),
+  saveTaskProgramProfile: (id: string, profile: ProgramProfile) =>
+    put<TaskProgramProfileResponse>(`/tasks/${encodeURIComponent(id)}/program-profile`, profile),
+
   // 重跑一条没跑成功的意图(blocked/exhausted/stopped)：置回 open，worker 会重新认领、从头再跑。
   rerunIntent: (taskId: string, intentId: string) =>
     post<{ id: string; reopened: number }>(`/tasks/${taskId}/intents/${intentId}/rerun`),
@@ -671,6 +698,10 @@ export const api = {
     get<Finding>(
       `/exploration/findings/${id}${contextTaskId ? `?context_task=${encodeURIComponent(contextTaskId)}` : ""}`,
     ),
+  findingRegression: (id: string) =>
+    get<FindingRegressionResponse>(`/findings/${encodeURIComponent(id)}/regression`),
+  checkFindingRegression: (id: string, allowWrite = false) =>
+    post<FindingRegressionCheck>(`/findings/${encodeURIComponent(id)}/regression/check`, { allow_write: allowWrite }),
   findingTraffic: (id: string, contextTask?: string) =>
     get<FindingTraffic>(
       `/exploration/findings/${id}/traffic${contextTask ? `?context_task=${encodeURIComponent(contextTask)}` : ""}`,
@@ -782,6 +813,19 @@ export const api = {
   taskCost: (task: string) => get<TaskCostEstimate>(`/tokens/cost${tq(task)}`),
   // 登录凭据自检：用任务配置的真实登录请求验证凭据是否可用。
   taskAuthCheck: (taskId: string) => post<AuthCheckResult>(`/tasks/${taskId}/auth-check`, {}),
+  // 任务级多角色凭据池（#24）：列表/创建/编辑/删除/逐条自检。
+  taskCredentials: (taskId: string) =>
+    get<{ credentials: TaskCredential[] | null }>(`/tasks/${taskId}/credentials`).then((r) => ({
+      credentials: arr(r.credentials),
+    })),
+  createTaskCredential: (taskId: string, input: TaskCredentialInput) =>
+    post<TaskCredential>(`/tasks/${taskId}/credentials`, input),
+  updateTaskCredential: (taskId: string, credentialId: number, input: TaskCredentialInput) =>
+    put<TaskCredential>(`/tasks/${taskId}/credentials/${credentialId}`, input),
+  deleteTaskCredential: (taskId: string, credentialId: number) =>
+    del<{ ok: boolean }>(`/tasks/${taskId}/credentials/${credentialId}`),
+  checkTaskCredential: (taskId: string, credentialId: number) =>
+    post<TaskCredentialCheck>(`/tasks/${taskId}/credentials/${credentialId}/check`, {}),
   // 任务证据附件：列表 / 下载地址（图片直链同源带 cookie，可直接当 img src）。
   taskArtifacts: (taskId: string) =>
     get<{ artifacts: TaskArtifact[] }>(`/tasks/${taskId}/artifacts`).then((r) => arr(r.artifacts)),
@@ -792,6 +836,9 @@ export const api = {
   // 修改附件归属（v0.4.20）：finding_id=0 表示任务级。
   updateTaskArtifact: (taskId: string, artifactId: number, findingId: number) =>
     patch<{ artifact: TaskArtifact }>(`/tasks/${taskId}/artifacts/${artifactId}`, { finding_id: findingId }),
+
+  deleteTaskArtifact: (taskId: string, artifactId: number) =>
+    del<{ ok: boolean; freed_bytes: number }>(`/tasks/${taskId}/artifacts/${artifactId}`),
   // 文档预览（v0.4.21）：第 N 页 JPEG / 手动重新生成。
   // 智能关联（v0.4.42）：把任务级数据/日志证据按主机交叉自动归属到唯一命中的漏洞。
   artifactsAutoBind: (taskId: string) =>
@@ -923,6 +970,10 @@ export const api = {
   // Purges every exchange and compacts the index; `reclaimed` is the bytes of
   // index handed back to the filesystem. Evidence bound to findings is kept.
   trafficDeleteAll: () => del<{ deleted: number; reclaimed: number }>(`/traffic/all`),
+  // 未引用流量 TTL：GET 计算 dry-run；POST 显式 dry_run=false 才删除。
+  trafficRetention: () => get<TrafficRetentionStatus>(`/traffic/retention`),
+  trafficRetentionRun: (dryRun = true) =>
+    post<TrafficRetentionResult>(`/traffic/retention`, { dry_run: dryRun }),
 
   // ---- app settings (runtime toggles) ----
   settings: () => get<Settings>(`/settings`),
@@ -1279,7 +1330,12 @@ export const api = {
     max_tokens_field?: string; // ""=max_tokens(默认) | "max_completion_tokens"（仅 openai 格式）
     session_header_key?: string; // 非空=每次请求带该 HTTP 头，头值=当前会话 session id；""=不发送
     user_agent?: string; // LLM 请求的 User-Agent；""=保持 SDK/Go 默认
-    retry?: LLMRetryOverride; // 本配置的重试覆盖；各项留 0 = 跟随全局重试策略
+    retry?: LLMRetryOverride;
+    preset_id?: string; // 本配置的重试覆盖；各项留 0 = 跟随全局重试策略
+    // 独立提示词（纯文本）。缺省 = 保留原值；"" = 清空。
+    prompt?: string;
+    prompt_mode?: string;
+    prompt_apply_inherited?: boolean;
   }) => post<{ id: number }>("/llm/profiles", p),
   deleteLLMProfile: (id: string) => del<{ deleted: number }>(`/llm/profiles/${id}`),
   activateLLMProfile: (id: string) => post<{ ok: boolean }>("/llm/profiles/active", { id: Number(id) }),
@@ -1292,6 +1348,19 @@ export const api = {
   saveLLMRetryPolicy: (p: LLMRetryPolicy) => post<LLMRetryPolicy>("/llm/retry-policy", p),
   fetchLLMModels: (provider: string, base_url: string, api_key: string, proxy = "", profile_id?: number, user_agent = "") =>
     post<{ ok: boolean; error?: string; models?: string[] }>("/llm/models", {
+      provider,
+      base_url,
+      api_key,
+      proxy,
+      profile_id,
+      user_agent,
+    }),
+
+  // 厂商知识层（v0.4.91）：预设清单 / 模型元数据推断 / 连通分诊
+  llmPresets: () => get<{ presets: LLMPreset[] }>("/llm/presets"),
+  llmModelMeta: (model: string) => get<LLMModelMeta>(`/llm/model-meta?model=${encodeURIComponent(model)}`),
+  llmCheck: (provider: string, base_url: string, api_key: string, proxy = "", profile_id?: number, user_agent = "") =>
+    post<LLMCheckResult>("/llm/check", {
       provider,
       base_url,
       api_key,
@@ -1385,6 +1454,30 @@ export const api = {
     get<{ variables: PromptVar[] }>(`/agents/${key}/variables`).then((r) => arr(r.variables)),
   previewAgentPrompt: (key: string, template: string, sample?: Record<string, string>) =>
     post<{ rendered: string; error?: string }>(`/agents/${key}/prompt/preview`, { template, sample }),
+  // 只读装配链：不连接 MCP、不建 provider，运行时段只给注入点与门控。
+  agentPromptChain: (key: string, profileId?: string) =>
+    get<AgentPromptChain>(
+      `/agents/${key}/prompt/chain${profileId ? `?profile_id=${encodeURIComponent(profileId)}` : ""}`,
+    ),
+  // (Agent, LLM 配置) 的 effort 覆盖：GET 同时返回每个配置的解析结果，避免 N+1。
+  agentEffortOverrides: (key: string) =>
+    get<AgentEffortOverrides>(`/agents/${key}/llm-effort-overrides`),
+  setAgentEffortOverride: (key: string, profileId: number, effort: string) =>
+    http<void>(`/agents/${key}/llm-effort-overrides/${profileId}`, {
+      method: "PUT",
+      body: JSON.stringify({ reasoning_effort: effort }),
+    }),
+  deleteAgentEffortOverride: (key: string, profileId: number) =>
+    http<void>(`/agents/${key}/llm-effort-overrides/${profileId}`, { method: "DELETE" }),
+  // 只读路由投影：静态来源链/池 + 任务内运行期转跳历史。不构建 provider。
+  agentLLMRoute: (key: string, opts?: { taskId?: string; limit?: number; before?: number }) => {
+    const q = new URLSearchParams();
+    if (opts?.taskId) q.set("task_id", opts.taskId);
+    if (opts?.limit) q.set("limit", String(opts.limit));
+    if (opts?.before) q.set("before", String(opts.before));
+    const qs = q.toString();
+    return get<AgentLLMRoute>(`/agents/${key}/llm-route${qs ? `?${qs}` : ""}`);
+  },
   getAgentVisibility: (key: string) => get<{ mcp: number[]; skill: string[] }>(`/agents/${key}/visibility`),
   setAgentVisibility: (key: string, mcp: number[], skill: string[]) =>
     put<{ ok: boolean }>(`/agents/${key}/visibility`, { mcp, skill }),

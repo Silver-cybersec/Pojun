@@ -257,11 +257,11 @@ func stopRelayTunnel(name string) {
 func (s *Server) c2ConfigGet(w http.ResponseWriter, r *http.Request) {
 	cfg := s.c2RelayConfig()
 	writeJSON(w, 200, map[string]any{
-		"mode":   cfg.Mode,
-		"host":   cfg.Host,
-		"ssh":    cfg.SSH,
-		"key":    cfg.Key,
-		"iface":  cfg.Iface,
+		"mode":     cfg.Mode,
+		"host":     cfg.Host,
+		"ssh":      cfg.SSH,
+		"key":      cfg.Key,
+		"iface":    cfg.Iface,
 		"has_pass": cfg.Pass != "",
 	})
 }
@@ -316,4 +316,3 @@ func (s *Server) c2ConfigPut(w http.ResponseWriter, r *http.Request) {
 	}
 	s.c2ConfigGet(w, r)
 }
-

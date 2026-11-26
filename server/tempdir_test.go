@@ -23,11 +23,13 @@ func tempDir(t *testing.T) string {
 	}
 	t.Cleanup(func() {
 		var last error
-		for i := 0; i < 20; i++ {
+		// 30 秒而非 1 秒：一份 nuclei 模板树有 1.4 万个文件，Windows 上
+		// RemoveAll 本身就要数秒，异步写手也需要时间退场。
+		for i := 0; i < 120; i++ {
 			if last = os.RemoveAll(dir); last == nil {
 				return
 			}
-			time.Sleep(50 * time.Millisecond)
+			time.Sleep(250 * time.Millisecond)
 		}
 		if last != nil {
 			t.Errorf("cleanup temp dir %s: %v", dir, last)

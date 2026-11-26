@@ -27,6 +27,12 @@ import (
 	"github.com/chu0119/pojun/vulnintel"
 )
 
+// vulnSyncDisabled 由测试在 TestMain 中置位。测试进程不需要真实的情报同步与
+// nuclei 模板树：每建一个 Manager，后台 goroutine 都会往临时 workspace 里
+// git clone 一份约 1.4 万文件 / 64MB 的模板树；测试结束时清理不及，就会在
+// %TEMP% 留下整棵目录（实测一次全量测试可积压十几 GB）。
+var vulnSyncDisabled bool
+
 // Task is one engagement: a description + goal + its own exploration store,
 // sharing the process-wide asset store. ID is the PG task id as a string; ExpID
 // is the exploration the task owns.
@@ -721,7 +727,7 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 	m.nucleiDir = vulnintel.TemplatesDir(m.dir)
 	agent.SetVulnIntelStore(m.vulnintel)
 	agent.SetNucleiTemplatesDir(m.nucleiDir)
-	if pg.GetBool(settingVulnIntelOn, true) {
+	if pg.GetBool(settingVulnIntelOn, true) && !vulnSyncDisabled {
 		go m.runVulnIntelSync()
 		// 近期高危快通道：独立 goroutine + 独立锁，不被主同步的 30 分钟一轮拖住。
 		go m.runVulnIntelFastLane()
@@ -1087,6 +1093,39 @@ func (m *Manager) ProxyAddr() string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.globalProxy
+}
+
+// ProxyDisplayAddr returns a read-only proxy address for static previews.
+// It never calls ProxyPoolPick, so opening a preview cannot advance round-robin
+// or pin a sticky host. Credentials are masked; a pool-only setup returns a
+// placeholder because the actual upstream is chosen per run.
+func (m *Manager) ProxyDisplayAddr() string {
+	if m == nil {
+		return ""
+	}
+	if m.traffic != nil && m.TrafficEnabled() {
+		return proxyDisplayAddr(m.traffic.ProxyAddr())
+	}
+	if m.traffic != nil && m.traffic.ProxyPoolConfigured() {
+		return "<运行时按代理池选择>"
+	}
+	m.mu.RLock()
+	g := m.globalProxy
+	m.mu.RUnlock()
+	return proxyDisplayAddr(g)
+}
+
+// proxyDisplayAddr masks proxy credentials for a read-only view. Invalid values
+// are replaced instead of echoed, so a malformed URL cannot leak userinfo.
+func proxyDisplayAddr(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if _, err := traffic.ValidateProxyURL(raw); err != nil {
+		return "<出口代理已配置（地址不可展示）>"
+	}
+	return maskProxyURL(raw)
 }
 
 // strictEgressBlockProxy 是严格出口的哨兵地址（连接必然失败）：宁可请求失败，

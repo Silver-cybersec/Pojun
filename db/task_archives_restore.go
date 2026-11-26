@@ -102,6 +102,7 @@ WHERE relation.source_task_id=$1 LIMIT 1`, taskID).Scan(&dependent)
 		{`DELETE FROM task_relations WHERE task_id=$1 OR source_task_id=$1`, []any{taskID}},
 		{`DELETE FROM task_asset_links WHERE task_id=$1`, []any{taskID}},
 		{`DELETE FROM task_llm_profiles WHERE task_id=$1`, []any{taskID}},
+		{`DELETE FROM task_credentials WHERE task_id=$1`, []any{taskID}},
 		{`DELETE FROM task_scope WHERE task_id=$1`, []any{taskID}},
 		{`DELETE FROM task_constraints WHERE exploration_id=$1`, []any{expID}},
 		{`DELETE FROM activity WHERE exploration_id=$1`, []any{expID}},
@@ -133,7 +134,7 @@ AND NOT EXISTS (
  name='',category_id=NULL,description='',goal='',paused=true,queued=false,queued_at=NULL,queue_mode='',
  llm_profile_id=NULL,active_llm_profile_id=NULL,llm_chain_revision=llm_chain_revision+1,
  company_id=NULL,parent_ref=NULL,timeout_seconds=0,coverage_enabled=true,pinned_at=NULL,
- first_run_at=NULL,deadline_at=NULL,archived_at=now(),deleted_at=now()
+ first_run_at=NULL,deadline_at=NULL,egress_snapshot=NULL,archived_at=now(),deleted_at=now()
 WHERE id=$1`, taskID); err != nil {
 		return err
 	}
@@ -278,6 +279,9 @@ WHERE archive.id=$1 FOR UPDATE OF archive,task`, archiveID).Scan(&taskID, &expID
 	} else {
 		warnings = append(warnings, warning...)
 	}
+	if err := insertArchiveRows(tx, "task_credentials", remappedTables["task_credentials"]); err != nil {
+		return nil, fmt.Errorf("restore task_credentials: %w", err)
+	}
 	for _, table := range []string{"task_asset_links", "findings"} {
 		if err := insertArchiveRows(tx, table, remappedTables[table]); err != nil {
 			return nil, fmt.Errorf("restore %s: %w", table, err)
@@ -285,6 +289,9 @@ WHERE archive.id=$1 FOR UPDATE OF archive,task`, archiveID).Scan(&taskID, &expID
 	}
 	if err := restoreFindingTrafficTx(tx, snapshot); err != nil {
 		return nil, fmt.Errorf("restore finding traffic: %w", err)
+	}
+	if err := insertArchiveRows(tx, "finding_regressions", remappedTables["finding_regressions"]); err != nil {
+		return nil, fmt.Errorf("restore finding_regressions: %w", err)
 	}
 	if streamedLLMRecords != "" {
 		count, err := insertArchiveJSONSequenceRows(tx, "llm_records", llmRecords)
@@ -398,8 +405,9 @@ func insertArchiveRows(tx *sql.Tx, table string, raw json.RawMessage) error {
 	}
 	allowed := map[string]bool{
 		"exploration_nodes": true, "exploration_edges": true, "exploration_anchors": true,
-		"task_constraints": true, "activity": true, "task_asset_links": true, "findings": true,
-		"llm_records": true, "llm_usage": true, "skill_usage": true, "tool_usage": true,
+		"task_constraints": true, "task_credentials": true, "activity": true, "task_asset_links": true, "findings": true,
+		"finding_regressions": true,
+		"llm_records":         true, "llm_usage": true, "skill_usage": true, "tool_usage": true,
 		"side_question_sessions": true, "side_question_requests": true,
 	}
 	if !allowed[table] {

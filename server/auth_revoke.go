@@ -40,9 +40,9 @@ type revokedJti struct {
 
 type revocationCache struct {
 	mu     sync.Mutex
-	before int64            // 哨兵：iat < before 的 token 全部失效
-	jtis   map[string]bool  // 已吊销的 jti 集合
-	loaded time.Time        // 上次从 settings 刷新的时间
+	before int64           // 哨兵：iat < before 的 token 全部失效
+	jtis   map[string]bool // 已吊销的 jti 集合
+	loaded time.Time       // 上次从 settings 刷新的时间
 }
 
 func (s *Server) revocations() *revocationCache {

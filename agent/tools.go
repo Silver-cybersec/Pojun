@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	acperm "github.com/Autumn-27/norma/permission"
@@ -87,6 +89,17 @@ type ToolSet struct {
 	// 与 Bash 的 HTTP_PROXY 同源（记录 MITM 或全局代理），保证流量留痕一致。
 	egressProxy string
 	egressCA    string
+	// programProfile 是任务级 SRC/众测 profile（v0.4.112）：仅用于原生 HTTP 的
+	// X-Bug-Bounty/RPS/dry-run 与提示渲染；nil=未配置，行为完全不变。
+	programProfile       *db.ProgramProfile
+	programHandle        string
+	dryRun               bool
+	programAllowedHosts  []string
+	programDeniedHosts   []string
+	programWindowStart   string
+	programWindowEnd     string
+	programLoc           *time.Location
+	programMaxConcurrent int
 	// lastScopeWarnings 是最近一次 record_fact 中 source/foreign 资产的提示，
 	// 只回传、不阻断写入。
 	lastScopeWarnings []string
@@ -99,7 +112,10 @@ type ToolSet struct {
 	as     *db.AssetStore   // asset store (optional; nil = asset tools not available)
 	cs     *db.CompanyStore // company store (optional)
 	ts     *db.ExplorationStore
-	worker string
+	// taskCredResolver resolves task-level named credentials (#24) without
+	// exposing secrets to the model. nil = feature unavailable (tests/legacy).
+	taskCredResolver TaskCredentialResolver
+	worker           string
 	taskID int64 // PG tasks.id; 0 when unknown (tests / orchestrator cross-task reads)
 	// coverageDisabled mirrors tasks.coverage_enabled=false. Stored inverted so the
 	// zero value (all existing ToolSet constructions) means ENABLED — matching the
@@ -231,10 +247,48 @@ func NewToolSet(ts *db.ExplorationStore, worker string) *ToolSet {
 
 // SetTaskID sets the PG task id on this ToolSet so that report_finding can
 // dual-write to the standalone findings table (which survives task deletion).
-func (t *ToolSet) SetTaskID(id int64) { t.taskID = id }
+func (t *ToolSet) SetTaskID(id int64) {
+	t.taskID = id
+	if t.programProfile != nil {
+		ConfigureProgramRPS(id, t.programProfile.RPS)
+	}
+}
+
+// SetProgramProfile 注入任务级 SRC/众测 profile（v0.4.112）。nil/空 profile
+// 会清掉限速与身份头，行为回到基线。必须在 SetTaskID 之后或同时调用；若先于
+// SetTaskID，SetTaskID 会补上 RPS 配置。
+func (t *ToolSet) SetProgramProfile(p *db.ProgramProfile) {
+	t.programProfile = p
+	if p == nil || p.IsZero() {
+		t.programHandle, t.dryRun = "", false
+		t.programAllowedHosts, t.programDeniedHosts = nil, nil
+		t.programWindowStart, t.programWindowEnd, t.programLoc = "", "", nil
+		t.programMaxConcurrent = 0
+		if t.taskID > 0 {
+			ConfigureProgramRPS(t.taskID, 0)
+		}
+		return
+	}
+	t.programHandle, t.dryRun = strings.TrimSpace(p.Handle), p.DryRun
+	t.programAllowedHosts, t.programDeniedHosts = p.AllowedHosts, p.DeniedHosts
+	t.programWindowStart, t.programWindowEnd = p.WindowStart, p.WindowEnd
+	t.programMaxConcurrent = p.MaxConcurrent
+	t.programLoc = time.Local
+	if strings.TrimSpace(p.Timezone) != "" {
+		if loc, err := time.LoadLocation(strings.TrimSpace(p.Timezone)); err == nil {
+			t.programLoc = loc
+		}
+	}
+	if t.taskID > 0 {
+		ConfigureProgramRPS(t.taskID, p.RPS)
+	}
+}
 
 // SetArtifactRecorder 注入证据附件存储（host 实现）。
 func (t *ToolSet) SetArtifactRecorder(r ArtifactRecorder) { t.artifactRecorder = r }
+
+// SetTaskCredentialResolver 注入任务级多角色凭据解析器（#24）。
+func (t *ToolSet) SetTaskCredentialResolver(r TaskCredentialResolver) { t.taskCredResolver = r }
 
 // SetRunDir 注入本次运行的工作目录（save_evidence 的相对路径基准）。
 func (t *ToolSet) SetRunDir(dir string) { t.runDir = dir }
@@ -492,10 +546,26 @@ func jsonResult(v any) (actool.Result, error) {
 
 func (t *ToolSet) graphOverview() actool.CoreTool {
 	return t.readExpTool("graph_overview",
-		"(探索链路图)探索态势蒸馏摘要：资产计数、无接口的站点、frontier、发现、hints(人类/主 agent 的战略提示，生成意图时须纳入)。规划时先调它。",
-		obj(map[string]any{}),
-		func(context.Context, json.RawMessage) (actool.Result, error) {
-			return jsonResult(t.graphOverviewData())
+		"(探索链路图)探索态势：默认返回窗口化摘要（index + 最新事实/漏洞/意图/覆盖缺口）。"+
+			"view=index 只要 ≤3KB 的决策索引；view=full 要完整快照；原始证据用 node_detail(id)。"+
+			"hints 是人类/主 agent 的战略提示，生成意图时须纳入。规划时先看它。",
+		obj(map[string]any{
+			"view": str("层级：summary(默认，窗口化摘要) / index(≤3KB 索引) / full(完整快照)"),
+		}),
+		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
+			var a struct {
+				View string `json:"view"`
+			}
+			_ = json.Unmarshal(in, &a)
+			data := t.graphOverviewData()
+			switch parseBlackboardView(a.View) {
+			case BlackboardIndex:
+				return actool.Text(renderBlackboardIndex(data)), nil
+			case BlackboardFull:
+				return jsonResult(data)
+			default:
+				return jsonResult(trimSummaryToBudget(blackboardSummaryData(data)))
+			}
 		})
 }
 
@@ -511,7 +581,11 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 	for _, g := range goals {
 		var p map[string]any
 		_ = json.Unmarshal(g.Payload, &p)
-		gsum = append(gsum, map[string]any{"id": g.ID, "state": g.State, "text": p["text"]})
+		gm := map[string]any{"id": g.ID, "state": g.State, "text": p["text"]}
+		if c, ok := p["criteria"].(string); ok && strings.TrimSpace(c) != "" {
+			gm["criteria"] = c
+		}
+		gsum = append(gsum, gm)
 	}
 	out["goals"] = gsum
 	// hints: 人类/主 agent 通过 add_hint 挂上图的战略提示；folded in so the
@@ -528,6 +602,13 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 		hsum = append(hsum, hint)
 	}
 	out["hints"] = hsum
+	// v0.4.100 终态经验：每个终态意图由引擎确定性地写一条 lesson（不是模型自述）。
+	// planner 每轮直接看到最近窗口，不必再 get_worker_trace 才知道上次为什么失败。
+	if t.ts != nil {
+		if rs, err := t.ts.RecentReflections(8); err == nil && len(rs) > 0 {
+			out["recent_lessons"] = compactReflections(rs)
+		}
+	}
 	// lineage from the exploration edges: an intent's parents (what it
 	// derived_from — possibly several facts combined) and its yields (the
 	// facts/findings it produced). factFrom maps a fact → the intent that
@@ -719,6 +800,24 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 				// 都重复携带的大量字符串，对规划决策价值有限）；具体主机按需 list_assets 查。
 				m["host_count"] = len(hosts)
 			}
+			// v0.4.100 覆盖矩阵：asset × dimension 的唯一事实源。planner 的派单、
+			// 引擎 nudge、autopilot 续杯与报告都从这里取数，避免三套口径。
+			if !t.coverageDisabled {
+				if cm := t.coverageMatrix(); cm != nil && cm.Assets > 0 {
+					cmv := map[string]any{
+						"assets":          cm.Assets,
+						"tested":          cm.Tested,
+						"in_progress":     cm.InProgress,
+						"untested_assets": cm.UntestedAssets,
+						"findings":        cm.Findings,
+						"by_dimension":    cm.ByDimension,
+					}
+					if len(cm.TopGaps) > 0 {
+						cmv["top_gaps"] = cm.TopGaps
+					}
+					m["matrix"] = cmv
+				}
+			}
 			if len(m) > 0 {
 				out["coverage"] = m
 			}
@@ -742,7 +841,11 @@ func (t *ToolSet) workerOverviewData() map[string]any {
 	for _, g := range goals {
 		var p map[string]any
 		_ = json.Unmarshal(g.Payload, &p)
-		gsum = append(gsum, map[string]any{"id": g.ID, "state": g.State, "text": p["text"]})
+		gm := map[string]any{"id": g.ID, "state": g.State, "text": p["text"]}
+		if c, ok := p["criteria"].(string); ok && strings.TrimSpace(c) != "" {
+			gm["criteria"] = c
+		}
+		gsum = append(gsum, gm)
 	}
 	out["goals"] = gsum
 	hints, _ := t.ts.ListByKind(db.KindHint, 20)
@@ -1734,17 +1837,23 @@ func (t *ToolSet) listGoals() actool.CoreTool {
 }
 
 func (t *ToolSet) proveGoal() actool.CoreTool {
-	return t.writeExpTool("prove_goal", "当你判断某个发现/事实证明了某个目标达成时调用：把证据节点连到目标节点，并标记目标 met。",
+	return t.writeExpTool("prove_goal", "当你判断某个发现/事实证明了某个目标达成时调用：把证据节点连到目标节点，并标记目标 met。目标带 criteria 时必须逐条给出 proofs（每条一个证据节点），全部满足才允许 met。",
 		obj(map[string]any{
 			"goal_id":     idp("目标节点 id"),
-			"evidence_id": idp("证明它的发现/事实节点 id"),
+			"evidence_id": idp("证明它的发现/事实节点 id（无 criteria 的目标用）"),
 			"reason":      str("为什么这个证据满足该目标"),
+			"proofs": map[string]any{"type": "array", "description": "目标带 criteria 时必填：逐条验收证据 [{criterion:该条原文, evidence_id:节点id}]。全部条目齐备且证据为 high/critical 才允许 met。",
+				"items": map[string]any{"type": "object"}},
 		}, "goal_id", "evidence_id"),
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
 				GoalID     json.RawMessage `json:"goal_id"`
 				EvidenceID json.RawMessage `json:"evidence_id"`
 				Reason     string          `json:"reason"`
+				Proofs     []struct {
+					Criterion  string          `json:"criterion"`
+					EvidenceID json.RawMessage `json:"evidence_id"`
+				} `json:"proofs"`
 			}
 			_ = json.Unmarshal(in, &a)
 			goal, ev := pid(a.GoalID), pid(a.EvidenceID)
@@ -1762,8 +1871,79 @@ func (t *ToolSet) proveGoal() actool.CoreTool {
 			if msg := capabilityEvidenceError(goalNode, evidenceNode); msg != "" {
 				return actool.Errorf(msg), nil
 			}
+			// v0.4.96（内部版 v0.9.49）：目标带 criteria 时逐条验收——每条必须有
+			// 独立证据（high/critical finding），全部满足才 met。无 criteria 的
+			// 旧目标走 capabilityGoalTerms 逻辑不变（向后兼容）。
+			var criteriaRaw string
+			if goalNode.Payload != nil {
+				var gp struct {
+					Criteria string `json:"criteria"`
+				}
+				if json.Unmarshal(goalNode.Payload, &gp) == nil {
+					criteriaRaw = strings.TrimSpace(gp.Criteria)
+				}
+			}
+			var proofsJSON []byte
+			if criteriaRaw != "" {
+				criteria := strings.Split(criteriaRaw, "；")
+				for i := range criteria {
+					criteria[i] = strings.TrimSpace(criteria[i])
+				}
+				if len(a.Proofs) < len(criteria) {
+					var unproven []string
+					for i, c := range criteria {
+						if i >= len(a.Proofs) {
+							unproven = append(unproven, fmt.Sprintf("第%d条「%s」缺证据", i+1, c))
+						}
+					}
+					return actool.Errorf(fmt.Sprintf("目标有 %d 条验收标准，仅提供 %d 条证据；以下条目缺 proof：%s。每条用独立的 high/critical finding 节点作为证据。",
+						len(criteria), len(a.Proofs), strings.Join(unproven, "；"))), nil
+				}
+				type goalProof struct {
+					Criterion   string `json:"criterion"`
+					EvidenceID  int64  `json:"evidence_id"`
+					EvidenceSum string `json:"evidence_summary,omitempty"`
+				}
+				var proofList []goalProof
+				for i, pf := range a.Proofs {
+					evID := pid(pf.EvidenceID)
+					if evID == 0 {
+						return actool.Errorf(fmt.Sprintf("第 %d 条 proof 的 evidence_id 缺失", i+1)), nil
+					}
+					evNode, err := t.ts.GetNode(evID)
+					if err != nil || evNode == nil || evNode.Kind != db.KindFinding {
+						return actool.Errorf(fmt.Sprintf("第 %d 条 proof 的 evidence_id=%d 必须是漏洞节点（high/critical finding）", i+1, evID)), nil
+					}
+					sev := ""
+					if evNode.Payload != nil {
+						var fp struct {
+							Severity string `json:"severity"`
+						}
+						if json.Unmarshal(evNode.Payload, &fp) == nil {
+							sev = fp.Severity
+						}
+					}
+					if sev != "high" && sev != "critical" {
+						return actool.Errorf(fmt.Sprintf("第 %d 条 proof（「%s」）的证据 severity=%q，必须为 high/critical", i+1, criteria[i], sev)), nil
+					}
+					proofList = append(proofList, goalProof{
+						Criterion:   criteria[i],
+						EvidenceID:  evID,
+						EvidenceSum: clipStr(evNodeSummary(evNode), 120),
+					})
+					_ = t.ts.Link(evID, db.RelProves, goal)
+				}
+				proofsJSON, _ = json.Marshal(proofList)
+			}
 			_ = t.ts.Link(ev, db.RelProves, goal)
 			_ = t.ts.SetNodeState(goal, "met")
+			if len(proofsJSON) > 0 {
+				// proof 结构原子合并进目标 payload（v0.4.96 内部版 v0.9.49 逐条验收）。
+				var proofs []map[string]any
+				if json.Unmarshal(proofsJSON, &proofs) == nil {
+					_ = t.ts.MergeGoalPayload(goal, map[string]any{"proofs": proofs})
+				}
+			}
 			// 每标记一个目标 met，就检查本任务是否【所有目标】都已 met；若是，自动判定
 			// 任务完成（置 GoalMet），无需再依赖模型显式调 goal_met。
 			if goals, err := t.ts.ListByKind(db.KindGoal, 1000); err == nil && len(goals) > 0 {
@@ -1782,6 +1962,28 @@ func (t *ToolSet) proveGoal() actool.CoreTool {
 			}
 			return actool.Text(fmt.Sprintf("goal %d marked met", goal)), nil
 		})
+}
+
+// evNodeSummary 从 finding/fact 节点的 payload 提取 summary 或 text 作为证据摘要。
+func clipStr(s string, n int) string {
+	if len(s) > n {
+		return s[:n] + "…"
+	}
+	return s
+}
+
+func evNodeSummary(n *db.Node) string {
+	if n == nil || n.Payload == nil {
+		return ""
+	}
+	var p struct {
+		Summary string `json:"summary"`
+		Text    string `json:"text"`
+	}
+	if json.Unmarshal(n.Payload, &p) == nil {
+		return strings.TrimSpace(p.Summary)
+	}
+	return ""
 }
 
 func (t *ToolSet) goalMet() actool.CoreTool {
@@ -1838,7 +2040,14 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 	return writeTool("report_finding", "记录确认的漏洞，用 evidence 提供命令输出、日志等可验证证据。任务上下文传当前 intent_id。返回的 finding_id 是独立漏洞记录 ID，finding_node_id 是探索节点 ID（第一行保留该节点编号）。", obj(map[string]any{
 		"vulnclass": str("漏洞类别,【必须】从标准类别里选:" + db.VulnClassPromptText() + "。具体 CVE/漏洞编号写进 name,类别选「已知漏洞」;实在不属于任何一类才用「其他」"), "name": str("漏洞名称"), "severity": str("critical|high|medium|low"), "summary": str("发现摘要"),
 		"intent_id": idp("当前任务的意图 id"), "asset_ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "受影响资产 id"},
-		"evidence":         str("证据/PoC 文本"),
+		"evidence": str("证据/PoC 文本"),
+		"verification_strategy": map[string]any{
+			"type": "string",
+			"enum": []string{"http_diff", "dual_identity", "effect_proof", "poc_replay", "oracle", "manual"},
+			"description": "可选：验证策略。http_diff=baseline+proof 两条流量对照；dual_identity=A/B 双身份；" +
+				"effect_proof=影响证据（取数/命令/权限）；poc_replay=可重放命令；oracle=阴性对照/validator；manual=需人工。" +
+				"省略时按证据自动推断；critical/high 建议显式给出。",
+		},
 		"root_cause_key":   str("可选：跨端点标识同一根因的稳定短标识（例如 jwt-alg-none、idor-order-owner）。同一根因在不同端点上的上报会据此归并；不确定时省略——省略只会少合并，不会错合并。"),
 		"evidence_hint_id": idp("可选：本任务中对应此漏洞的提示节点 ID，自动携带其结构化 traffic_refs；不能引用继承提示或其他漏洞的提示"),
 		"traffic_refs": map[string]any{"type": "array", "description": "可选；HTTP/HTTPS 漏洞先检索并逐条核实请求/响应确实支持漏洞结论，再按复现顺序填写真实 ID。TCP 等非 HTTP 漏洞、未采集或找不到确切记录时省略或传 []，不阻止上报；可在 evidence 说明原因并提供其他可验证证据。不要猜测 ID、按域名/时间推定关联或仅为补包重复探测。用途 baseline 正常对照 / proof 漏洞证明 / verification 补充验证 / supporting 辅助证据。若某个 ID 不存在，漏洞仍会正常入库，该 ID 会在返回值的 skipped_traffic_refs 里列出，可用 traffic_get 核实后用 bind_finding_traffic 补绑。",
@@ -1846,14 +2055,51 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 	}, "vulnclass", "severity", "summary"), func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 		var a struct {
 			VulnClass, Name, Severity, Summary, Evidence string
+			VerificationStrategy                         string            `json:"verification_strategy"`
 			RootCauseKey                                 string            `json:"root_cause_key"`
 			IntentID                                     json.RawMessage   `json:"intent_id"`
 			AssetIDs                                     []json.RawMessage `json:"asset_ids"`
 			TrafficRefs                                  []db.TrafficRef   `json:"traffic_refs"`
 			EvidenceHintID                               json.RawMessage   `json:"evidence_hint_id"`
 		}
-		if err := json.Unmarshal(in, &a); err != nil {
-			return actool.Errorf(err.Error()), nil
+		// v0.4.101：写入工具参数容错。模型常把入参包在 {"finding":{...}}、
+		// 用 vulnerability/desc/proof 等别名，或把 asset_ids 写成单个数字。
+		// 先归一，避免一个可恢复的格式问题丢掉已确认漏洞。
+		normalizedNote := ""
+		normIn := in
+		if norm, nerr := normalizeToolInput(in, "finding", "vulnerability", "result", "data"); nerr == nil {
+			normIn = norm
+			var orig bytes.Buffer
+			if json.Compact(&orig, in) == nil && string(norm) != orig.String() {
+				normalizedNote = "已自动归一写入参数格式"
+			}
+		}
+		if err := json.Unmarshal(normIn, &a); err != nil {
+			return actool.Errorf("report_finding 入参无法解析：" + err.Error()), nil
+		}
+		a.VulnClass = db.NormalizeVulnClass(a.VulnClass)
+		if a.VulnClass == "" {
+			a.VulnClass = deriveVulnClass(a.Name + " " + a.Summary + " " + a.Evidence)
+		}
+		if strings.TrimSpace(a.Summary) == "" {
+			a.Summary = firstLine(strings.TrimSpace(a.Name+" "+a.Evidence), 160)
+		}
+		if strings.TrimSpace(a.Name) == "" {
+			a.Name = a.VulnClass
+		}
+		if strings.TrimSpace(a.VulnClass) == "" && strings.TrimSpace(a.Summary) == "" && strings.TrimSpace(a.Evidence) == "" {
+			return actool.Errorf("report_finding 缺关键字段：vulnclass/severity/summary 至少要有漏洞类别与摘要；请从标准类别里选：" + db.VulnClassPromptText()), nil
+		}
+		if strings.TrimSpace(a.Severity) == "" {
+			a.Severity = "medium"
+			normalizedNote += "；未给 severity，按 medium 处理"
+		}
+		a.VerificationStrategy = strings.ToLower(strings.TrimSpace(a.VerificationStrategy))
+		if a.VerificationStrategy == "" {
+			a.VerificationStrategy = deriveVerificationStrategy(a.Evidence, len(a.TrafficRefs))
+		}
+		if !verificationStrategies[a.VerificationStrategy] {
+			a.VerificationStrategy = "manual"
 		}
 		if t.ts == nil {
 			return actool.Errorf("report_finding 需要任务上下文；平台对话请通过 add_task_hint 向对应任务交接漏洞，并在提示中携带已有的 traffic_refs，由任务 Agent 登记。已登记漏洞可用 bind_finding_traffic 补绑。"), nil
@@ -1925,7 +2171,7 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 		if msg := t.scopeGuardError(pidList(a.AssetIDs)); msg != "" {
 			return actool.Errorf(msg), nil
 		}
-		input := db.RecordFindingInput{TaskID: t.taskID, ExplorationID: t.ts.ID(), IntentID: pid(a.IntentID), VulnClass: a.VulnClass, Name: a.Name, Severity: a.Severity, Summary: a.Summary, Evidence: a.Evidence, RootCauseKey: a.RootCauseKey, Worker: t.worker, AssetIDs: pidList(a.AssetIDs), CrossTaskNotifyDedup: t.CrossTaskNotifyDedup}
+		input := db.RecordFindingInput{TaskID: t.taskID, ExplorationID: t.ts.ID(), IntentID: pid(a.IntentID), VulnClass: a.VulnClass, Name: a.Name, Severity: a.Severity, Summary: a.Summary, Evidence: a.Evidence, VerificationStrategy: a.VerificationStrategy, RootCauseKey: a.RootCauseKey, Worker: t.worker, AssetIDs: pidList(a.AssetIDs), CrossTaskNotifyDedup: t.CrossTaskNotifyDedup}
 		var recorded *db.RecordedFinding
 		if t.findingRecorder != nil {
 			recorded, err = t.findingRecorder.Record(ctx, input, refs)
@@ -1954,13 +2200,29 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 		}
 		result := struct {
 			*db.RecordedFinding
-			EvidenceStatus     string `json:"evidence_status"`
-			EvidenceNote       string `json:"evidence_note,omitempty"`
-			EvidenceVerifyNote string `json:"evidence_verify_note,omitempty"`
-			ChainIntentID      int64  `json:"chain_intent_id,omitempty"`
-			SRCReview          any    `json:"src_review,omitempty"`
-			ChainNote          string `json:"chain_note,omitempty"`
+			EvidenceStatus     string             `json:"evidence_status"`
+			EvidenceNote       string             `json:"evidence_note,omitempty"`
+			EvidenceVerifyNote string             `json:"evidence_verify_note,omitempty"`
+			ChainIntentID      int64              `json:"chain_intent_id,omitempty"`
+			SRCReview          any                `json:"src_review,omitempty"`
+			ChainNote          string             `json:"chain_note,omitempty"`
+			VerificationAudit  *VerificationAudit `json:"verification_audit,omitempty"`
 		}{RecordedFinding: recorded, EvidenceStatus: "bound", EvidenceVerifyNote: verifyNote, SRCReview: review}
+		if normalizedNote != "" {
+			result.EvidenceNote = normalizedNote
+		}
+		trafficN := 0
+		if recorded.Traffic != nil {
+			trafficN = len(recorded.Traffic.Bindings)
+		}
+		audit := auditFindingPayload(&db.DBFinding{
+			ID: recorded.FindingID, VulnClass: a.VulnClass, Name: a.Name, Severity: a.Severity,
+			Summary: a.Summary, Evidence: a.Evidence,
+		}, map[string]any{"verification_strategy": a.VerificationStrategy}, trafficN)
+		result.VerificationAudit = &audit
+		if audit.Status == "fail" && (a.Severity == "critical" || a.Severity == "high") {
+			result.EvidenceNote = strings.TrimSpace(result.EvidenceNote + " 独立复核未通过：" + strings.Join(audit.Missing, "、"))
+		}
 		if len(recorded.CrossTaskDupTasks) > 0 {
 			ids := make([]string, 0, len(recorded.CrossTaskDupTasks))
 			for _, tid := range recorded.CrossTaskDupTasks {
@@ -2010,6 +2272,22 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 				pidList(a.AssetIDs), recorded.NodeID, pid(a.IntentID), review.Missing); cid > 0 || note != "" {
 				result.ChainIntentID = cid
 				result.ChainNote = note
+			}
+		}
+		// 经验层（v0.4.94）：validator PASS 的 critical/high 上报 → playbook 入库 +
+		// 同簇端点变体意图族（确定性派发，planner 的 variant hunting 纪律之上再加下限）。
+		if !recorded.Duplicate && (a.Severity == "critical" || a.Severity == "high") {
+			marker := ValidateMarkerFromEvidence(a.Evidence)
+			if marker != "" {
+				if CapturePlaybookFn != nil && t.taskID > 0 && recorded.FindingID > 0 {
+					if pbID, err := CapturePlaybookFn(t.taskID, recorded.FindingID, marker); err == nil && pbID > 0 {
+						result.EvidenceNote += fmt.Sprintf(" ✅ 成功链路已沉淀为 playbook #%d（同类目标将自动参考）。", pbID)
+					}
+				}
+				if n, vnote := DispatchVariantIntents(t, a.VulnClass, a.Severity, a.Evidence,
+					recorded.NodeID, pid(a.IntentID), pidList(a.AssetIDs)); n > 0 && vnote != "" {
+					result.EvidenceNote += " " + vnote
+				}
 			}
 		}
 		// 回溯归属（v0.4.47）：同一意图目录下所有 finding_id 为空的证据一次性归属。
@@ -2275,9 +2553,24 @@ func (t *ToolSet) recordFact() actool.CoreTool {
 				Facts    []factItem `json:"facts"`
 				factItem            // 单条模式 + 批量默认 intent_id
 			}
-			_ = json.Unmarshal(in, &a)
+			// v0.4.101：容错（外层 fact/data 包装、desc/detail_text 别名、asset_ids 标量）。
+			normIn := in
+			if norm, nerr := normalizeToolInput(in, "fact", "result", "data"); nerr == nil {
+				normIn = norm
+			}
+			if err := json.Unmarshal(normIn, &a); err != nil {
+				return actool.Errorf("record_fact 入参无法解析：" + err.Error()), nil
+			}
 			batch := len(a.Facts) > 0
 			items := a.Facts
+			// 单条模式：summary 缺失时从 detail/evidence 首行兜底（不改变批量语义）。
+			if !batch && strings.TrimSpace(a.factItem.Summary) == "" {
+				if d := strings.TrimSpace(a.factItem.Detail); d != "" {
+					a.factItem.Summary = firstLine(d, 160)
+				} else if e := strings.TrimSpace(a.factItem.Evidence); e != "" {
+					a.factItem.Summary = firstLine(e, 160)
+				}
+			}
 			// 单次最多 10 条（v0.4.44）：防 worker 一次调用写几十条拆碎的事实，
 			// 图谱会被灌爆。超限截断并在返回值里告知模型。
 			if len(items) > 10 {
@@ -2366,6 +2659,9 @@ func (t *ToolSet) addOneHint(it hintItem) (int64, error) {
 type goalItem struct {
 	Text      string `json:"text"`
 	VulnClass string `json:"vulnclass"`
+	// Criteria 是目标的验收标准（多条用「；」分隔，v0.4.96 内部版 v0.9.49 同步）。
+	// 非空时 prove_goal 必须逐条给出 proof 才允许 met；空 = 旧目标走 capabilityGoalTerms。
+	Criteria string `json:"criteria,omitempty"`
 }
 
 // addOneGoal 挂一条 goal 节点(open)到探索图:连到任务根(origin fact,rel spawns)。
@@ -2379,6 +2675,9 @@ func (t *ToolSet) addOneGoal(it goalItem) (int64, error) {
 	payload := map[string]any{"text": text}
 	if vc := db.NormalizeVulnClass(it.VulnClass); vc != "" {
 		payload["vulnclass"] = vc
+	}
+	if strings.TrimSpace(it.Criteria) != "" {
+		payload["criteria"] = strings.TrimSpace(it.Criteria)
 	}
 	origin := t.worker
 	if origin == "" {
@@ -2978,6 +3277,8 @@ func (t *ToolSet) PlannerTools() []actool.CoreTool {
 		// search_vulns / get_vuln：识别出目标组件后查公开已知漏洞（NVD+KEV），
 		// 规划阶段把「有现成利用的方向」排进 todolist。
 		t.searchVulns(), t.getVuln(), t.getPoc(), t.scanWithNuclei(), t.netContext(),
+		// search_experience（v0.4.103）：按需检索终态经验与跨任务 playbook。
+		t.searchExperience(),
 		// listener_*：回连接收器（红队 C2 前置）——start/stop 走 ask 审批，sessions 只读。
 		t.listenerStart(), t.listenerStop(), t.listenerSessions(),
 		// auth_request：用资产上已登记的凭据组装带认证的请求（横向/越权验证的前提）。
@@ -2990,6 +3291,9 @@ func (t *ToolSet) PlannerTools() []actool.CoreTool {
 		t.searchRecentCritical(),
 		// evidence_check（v0.4.71）：规划阶段复核高/危漏洞证据是否足以支撑危害结论。
 		t.evidenceCheck(),
+		t.auditFindingTool(),
+		t.validateFinding(),
+		t.readOutput(),
 	}
 }
 

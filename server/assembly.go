@@ -75,12 +75,35 @@ func wireAgentAugment(pg *db.DB, skillDir string, hostTools func() ([]actool.Cor
 			return ""
 		}
 		desc := loadDesc()
+		const maxRunes = 6000 // v0.4.103：速查块预算（约 2-3k token），防止技能增长挤占上下文
 		var b strings.Builder
 		b.WriteString("【技能速查（你已绑定的 skill；命中场景必须先调 Skill 元工具加载全文再动手）】\n")
+		used := len([]rune(b.String()))
+		truncated := false
 		for _, n := range names {
-			if d, ok := desc[n]; ok && d != "" {
-				b.WriteString("- " + n + "：" + d + "\n")
+			d := desc[n]
+			line := "- " + n
+			if d != "" {
+				line += "：" + d
 			}
+			line += "\n"
+			if used+len([]rune(line)) > maxRunes {
+				// 预算用尽后仍保留技能名（名称是路由信息），描述省略。
+				short := "- " + n + "\n"
+				if used+len([]rune(short)) > maxRunes {
+					truncated = true
+					continue
+				}
+				b.WriteString(short)
+				used += len([]rune(short))
+				truncated = true
+				continue
+			}
+			b.WriteString(line)
+			used += len([]rune(line))
+		}
+		if truncated {
+			b.WriteString("（部分技能描述因预算省略；名称仍可 Skill(name=...) 加载）\n")
 		}
 		b.WriteString("调用方式：Skill(name=\"<名称>\")。技能内有验证口径/假点清单/报告模板，先加载可避免漏检与误报。")
 		return b.String()
@@ -290,6 +313,56 @@ func wireTools(pg *db.DB, domainReg map[string]actool.CoreTool) {
 	agent.FindingTrafficBindingEnabled = func() bool { return pg.GetBool(settingAgentTrafficBinding, false) }
 	// 证据附件列表（v0.4.9）：agent 的 list_artifacts 工具读取本任务已登记附件。
 	agent.ListTaskArtifacts = func(taskID string) ([]db.TaskArtifact, error) { return pg.ListTaskArtifacts(taskID) }
+	// 经验层（v0.4.94）：playbook 捕获/匹配与变体派发的 db 通道。
+	if err := pg.EnsurePlaybookSchema(); err != nil {
+		log.Printf("[playbook] schema 初始化失败: %v", err)
+	}
+	agent.CapturePlaybookFn = func(taskID int64, findingID int64, marker string) (int64, error) {
+		return pg.CapturePlaybook(taskID, findingID, marker)
+	}
+	agent.FindingAssetInfoFn = func(findingID int64) (string, int64, []string, string, int64, bool) {
+		var assetIDsJSON []byte
+		if err := pg.QueryRow(`SELECT asset_ids FROM findings WHERE id=$1`, findingID).Scan(&assetIDsJSON); err != nil {
+			return "", 0, nil, "", 0, false
+		}
+		var ids []int64
+		if json.Unmarshal(assetIDsJSON, &ids) != nil || len(ids) == 0 {
+			return "", 0, nil, "", 0, false
+		}
+		var rootDomain, url string
+		var techs []string
+		var simhash int64
+		var assetID int64
+		if err := pg.QueryRow(`SELECT COALESCE(root_domain,''), COALESCE(simhash,0), COALESCE(technologies,'{}'::text[]), COALESCE(url,''), id FROM assets WHERE id=$1`, ids[0]).
+			Scan(&rootDomain, &simhash, &techs, &url, &assetID); err != nil || assetID == 0 {
+			return "", 0, nil, "", 0, false
+		}
+		return rootDomain, simhash, techs, url, assetID, true
+	}
+	agent.SimilarEndpointsFn = func(rootDomain string, simhash int64, excludeID int64, limit int) ([]db.Asset, error) {
+		return pg.SimilarHTTPEndpoints(rootDomain, simhash, excludeID, limit)
+	}
+	agent.MatchPlaybooksFn = func(vulnClass string, techs []string, rootDomain string, limit int) []db.Playbook {
+		return pg.MatchPlaybooks(vulnClass, techs, rootDomain, limit)
+	}
+	agent.TaskRootAndTechsFn = func(taskID int64) (string, []string) {
+		var rootDomain string
+		if err := pg.QueryRow(`SELECT COALESCE(root_domain,'') FROM assets WHERE task_ids @> ARRAY[$1::bigint] AND root_domain <> '' LIMIT 1`, taskID).Scan(&rootDomain); err != nil {
+			return "", nil
+		}
+		var techs []string
+		if err := pg.QueryRow(`SELECT COALESCE(array_agg(DISTINCT t), '{}') FROM unnest((SELECT array_agg(technologies) FROM assets WHERE task_ids @> ARRAY[$1::bigint] AND technologies <> '{}')) AS t`, taskID).Scan(&techs); err != nil {
+			techs = nil
+		}
+		return rootDomain, techs
+	}
+	agent.VariantIntentsEnabledFn = func() bool { return variantIntentsFromPG(pg) }
+	agent.PlaybookInjectEnabledFn = func() bool { return playbookInjectFromPG(pg) }
+	agent.TaskArtifactQuota = func(taskID string) (count int, bytes int64, maxCount int, maxBytes int64) {
+		count, bytes, _ = pg.CountTaskArtifacts(taskID)
+		maxCount, maxBytes = pg.ArtifactQuota()
+		return
+	}
 	// reporter 的 chat 会话没有任务上下文（v0.4.20）：允许工具按 finding_id
 	// 反查所属任务，避免 list_artifacts 永远返回空。
 	agent.FindingTaskID = func(findingID int64) (string, error) {

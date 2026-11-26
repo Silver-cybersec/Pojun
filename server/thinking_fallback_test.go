@@ -117,7 +117,10 @@ func TestDowngradedConfigKeepsEverythingElse(t *testing.T) {
 	if down.ThinkingType != base.ThinkingType {
 		t.Fatal("降级不应改 ThinkingType 本身（只是不发送它）")
 	}
-	for _, pair := range []struct{ name string; a, b any }{
+	for _, pair := range []struct {
+		name string
+		a, b any
+	}{
 		{"Format", down.Format, base.Format},
 		{"BaseURL", down.BaseURL, base.BaseURL},
 		{"APIKey", down.APIKey, base.APIKey},

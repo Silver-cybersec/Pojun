@@ -9,6 +9,10 @@
 //	 把内置 agent 提示词更新到当前二进制内置版本（老库的 prompt 是首次安装
 //	 时的旧版，新版本不会自动覆盖）。默认只报告差异；--force 才写回（会覆盖
 //	 该 agent 的自定义编辑，慎用）。
+//
+//	pojun-maint idscan --config /opt/pojun/config.json [--db FILE] [--out FILE]
+//	 离线只读扫描流量索引，统计品牌/能力/工具默认值命中与录制覆盖率（issue #40）。
+//	 不连 PostgreSQL、不发网络请求、不写流量库。
 package main
 
 import (
@@ -34,19 +38,28 @@ import (
 )
 
 const (
-	maxFileBytes = 20 << 20
-	maxTaskCount = 300 // 与服务端限额一致（v0.4.23 起 300 个/500MB）
-	maxTaskBytes = 500 << 20
 	maxPerRun    = 60 // 单次扫描最多新增，避免一次把临时文件全收进来
 	artifactsDir = "artifacts"
 )
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: pojun-maint <scan-artifacts|previews|reset-prompts|fix-permissions|scope-audit> --config <config.json> [--force] [--out file]")
+		fmt.Fprintln(os.Stderr, "usage: pojun-maint <scan-artifacts|previews|reset-prompts|fix-permissions|scope-audit|idscan|bench> --config <config.json> [--force] [--out file]")
 		os.Exit(2)
 	}
 	cmd := os.Args[1]
+	// idscan is offline and read-only: it needs neither PostgreSQL nor the shared
+	// flag set (whose ExitOnError would reject --db/--tiers/--task-map with exit 2).
+	if cmd == "idscan" {
+		runIDScan(os.Args[2:])
+		return
+	}
+	// bench 也是独立 flag 集：score/compare/validate 各有自己的参数，不能和
+	// scan-artifacts 的共享 flag 混在一起。
+	if cmd == "bench" {
+		runBench(os.Args[2:])
+		return
+	}
 	fs := flag.NewFlagSet(cmd, flag.ExitOnError)
 	cfgPath := fs.String("config", "/opt/pojun/config.json", "POJUN config.json 路径")
 	dataDir := fs.String("data", "", "数据目录（默认取 config 目录下的 data）")
@@ -87,7 +100,6 @@ func main() {
 		os.Exit(2)
 	}
 }
-
 
 // auditAutoScope 按自动范围归属规则回放 source=auto 的范围行，输出
 // 「应保留/建议清理」清单。只读——删除必须先 pg_dump 备份、人工确认后执行。
@@ -202,6 +214,8 @@ func scanArtifacts(pg *db.DB, dataDir string) {
 			}
 		}
 		count, bytesUsed, _ := pg.CountTaskArtifacts(taskID)
+		// #50：限额与服务端同源（settings 可覆盖，不再各抄一份常量）。
+		maxCount, maxBytes := pg.ArtifactQuota()
 		added, skipped := 0, 0
 		_ = filepath.WalkDir(root, func(path string, d os.DirEntry, walkErr error) error {
 			if walkErr != nil {
@@ -225,13 +239,13 @@ func scanArtifacts(pg *db.DB, dataDir string) {
 				return nil
 			}
 			info, e := d.Info()
-			if e != nil || info.Size() <= 0 || info.Size() > maxFileBytes {
+			if e != nil || info.Size() <= 0 || info.Size() > db.ArtifactMaxFileBytesDefault {
 				return nil
 			}
-			if added >= maxPerRun || count+added >= maxTaskCount {
+			if added >= maxPerRun || count+added >= maxCount {
 				return nil
 			}
-			if bytesUsed+info.Size() > maxTaskBytes {
+			if bytesUsed+info.Size() > maxBytes {
 				return nil
 			}
 			sha, e := fileSHA(path)

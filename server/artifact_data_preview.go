@@ -161,7 +161,6 @@ func clipValue(v any) any {
 	return s
 }
 
-
 // parseJSONPreviewItems 把数组元素摊成表格行（与 []any 分支共用列收集逻辑）。
 func parseJSONPreviewItems(arr []any) *dataParseResult {
 	res := &dataParseResult{Type: "json"}

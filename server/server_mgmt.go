@@ -1835,6 +1835,26 @@ func (s *Server) pgListProfiles(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
+	// Prompt bodies are fetched in one query and attached to the DTO; they are
+	// deliberately absent from profileCols so the failover chain stays lean. A
+	// failed read is fatal: returning profiles with blank prompts would let the
+	// editor save an explicit empty prompt and silently wipe long text.
+	prompts, err := pg.ProfilePrompts()
+	if err != nil {
+		writeErr(w, 500, "读取独立提示词失败")
+		return
+	}
+	for _, p := range ps {
+		if pi, ok := prompts[p.ID]; ok {
+			p.Prompt, p.PromptMode, p.PromptApplyInherited = pi.Text, pi.Mode, pi.ApplyInherited
+		}
+	}
+	// 反向引用：哪些 Agent 覆盖了本配置的强度。读取失败不阻断列表（这是辅助信息）。
+	if ovs, err := pg.AllEffortOverrides(); err == nil {
+		for _, p := range ps {
+			p.EffortOverrides = ovs[p.ID]
+		}
+	}
 	writeJSON(w, 200, map[string]any{"profiles": llmProfileDTOs(ps)})
 }
 
@@ -1852,6 +1872,11 @@ func (s *Server) pgSaveProfile(w http.ResponseWriter, r *http.Request) {
 		db.LLMProfile
 		APIKey    string `json:"api_key"`
 		Streaming *bool  `json:"streaming"`
+		// 独立提示词三态影子指针：缺省=保留原值；""=清空；文本=写入。
+		// 沿用 Streaming *bool 的先例，避免旧客户端/旧 web bundle 一保存就清空长文。
+		Prompt               *string `json:"prompt"`
+		PromptMode           *string `json:"prompt_mode"`
+		PromptApplyInherited *bool   `json:"prompt_apply_inherited"`
 	}
 	if err := decode(r, &body); err != nil {
 		writeErr(w, 400, err.Error())
@@ -1883,8 +1908,28 @@ func (s *Server) pgSaveProfile(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "user_agent 不能包含换行")
 		return
 	}
+	// 独立提示词：读旧值回填三态，再做纯文本归一与长度/枚举校验。读取失败必须
+	// 拒绝保存，否则会以零值回填并静默清空用户长文。
+	oldPrompt := db.PromptInfo{}
+	if p.ID != 0 {
+		var err error
+		oldPrompt, err = pg.ProfilePrompt(p.ID)
+		if err != nil {
+			writeErr(w, 500, "读取原有独立提示词失败，已拒绝保存以免清空")
+			return
+		}
+	}
+	prompt, promptErr := normalizeProfilePromptRequest(oldPrompt, body.Prompt, body.PromptMode, body.PromptApplyInherited)
+	if promptErr != "" {
+		writeErr(w, 400, promptErr)
+		return
+	}
 	id, err := pg.SaveProfile(&p)
 	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	if err := pg.SetProfilePrompt(id, prompt.Text, prompt.Mode, prompt.ApplyInherited); err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
@@ -2047,22 +2092,54 @@ func (s *Server) pgLLMPoolReset(w http.ResponseWriter, r *http.Request) {
 // Anthropic-compatible third parties (e.g. DeepSeek) whose model list lives only on
 // the OpenAI path, it falls back to the OpenAI endpoint at the stripped root.
 func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Provider  string `json:"provider"` // "openai" | "anthropic"
-		BaseURL   string `json:"base_url"`
-		APIKey    string `json:"api_key"`
-		Proxy     string `json:"proxy"`
-		UserAgent string `json:"user_agent"` // 非空=与模型请求一致的 UA；空=profile 存的值
-		ProfileID *int64 `json:"profile_id"` // fallback: use stored key from this profile
+	req, apiKey, userAgent, ok := s.decodeModelsReq(w, r)
+	if !ok {
+		return
 	}
+	if apiKey == "" {
+		writeJSON(w, 200, map[string]any{"ok": false, "error": "未提供 API Key"})
+		return
+	}
+	models, _, lastErr := fetchProviderModels(r.Context(), req.Provider, req.BaseURL, apiKey, req.Proxy, userAgent)
+	if len(models) > 0 {
+		writeJSON(w, 200, map[string]any{"ok": true, "models": models})
+		return
+	}
+	if lastErr == errAllEmpty {
+		writeJSON(w, 200, map[string]any{"ok": true, "models": []string{}})
+		return
+	}
+	if lastErr == "" {
+		lastErr = "未获取到模型列表"
+	}
+	writeJSON(w, 200, map[string]any{"ok": false, "error": lastErr})
+}
+
+// errAllEmpty 标记「候选端点全部 200 但列表为空」——/llm/check 用它区分
+// 网关兼容性问题与硬错误；/llm/models 对它仍返回 ok:true 空列表（历史行为）。
+const errAllEmpty = "all candidates returned empty lists"
+
+// llmModelsReq 是 /llm/models 与 /llm/check 共用的请求体。
+type llmModelsReq struct {
+	Provider  string `json:"provider"` // "openai" | "anthropic"
+	BaseURL   string `json:"base_url"`
+	APIKey    string `json:"api_key"`
+	Proxy     string `json:"proxy"`
+	UserAgent string `json:"user_agent"` // 非空=与模型请求一致的 UA；空=profile 存的值
+	ProfileID *int64 `json:"profile_id"` // fallback: use stored key from this profile
+}
+
+// decodeModelsReq 是 /llm/models 与 /llm/check 共用的请求解码与 key/UA 兜底。
+// 返回 ok=false 时已写响应。
+func (s *Server) decodeModelsReq(w http.ResponseWriter, r *http.Request) (req llmModelsReq, apiKey, userAgent string, ok bool) {
 	if err := decode(r, &req); err != nil {
 		writeErr(w, 400, err.Error())
-		return
+		return req, "", "", false
 	}
 	// Resolve API key: form input > profile stored key. UA 同样从 profile 兜底：
 	// 网关拦默认 UA 时，「加载模型」也应该和真实请求走同一套特征。
-	apiKey := strings.TrimSpace(req.APIKey)
-	userAgent := strings.TrimSpace(req.UserAgent)
+	apiKey = strings.TrimSpace(req.APIKey)
+	userAgent = strings.TrimSpace(req.UserAgent)
 	if req.ProfileID != nil {
 		if p, err := s.m.pg.ProfileByID(*req.ProfileID); err == nil && p != nil {
 			if apiKey == "" {
@@ -2073,13 +2150,15 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	if apiKey == "" {
-		writeJSON(w, 200, map[string]any{"ok": false, "error": "未提供 API Key"})
-		return
-	}
+	return req, apiKey, userAgent, true
+}
 
-	baseURL := strings.TrimRight(strings.TrimSpace(req.BaseURL), "/")
-	provider := strings.TrimSpace(req.Provider)
+// fetchProviderModels 按协议格式试候选端点，返回首个非空模型列表。
+// lastCode/lastErr 供 /llm/check 做失败分类：lastCode 是最后一次拿到 HTTP 响应
+// 的状态码（网络错误时为 0）；lastErr==errAllEmpty 表示全 200 但列表空。
+func fetchProviderModels(ctx context.Context, provider, baseURL, apiKey, proxy, userAgent string) (models []string, lastCode int, lastErr string) {
+	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	provider = strings.TrimSpace(provider)
 
 	// Candidate endpoints to try in order. Some Anthropic-compatible providers
 	// (e.g. DeepSeek) implement /v1/messages under an /anthropic path but expose
@@ -2129,7 +2208,7 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 
 	// Build HTTP client with optional proxy.
 	transport := &http.Transport{}
-	if p := strings.TrimSpace(req.Proxy); p != "" {
+	if p := strings.TrimSpace(proxy); p != "" {
 		if pu, err := url.Parse(p); err == nil {
 			transport.Proxy = http.ProxyURL(pu)
 		}
@@ -2137,10 +2216,9 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 	client := &http.Client{Transport: transport, Timeout: 30 * time.Second}
 
 	// Try each candidate; return the first that yields a non-empty model list.
-	var lastErr string
 	emptyOK := false
 	for _, c := range candidates {
-		httpReq, err := http.NewRequestWithContext(r.Context(), http.MethodGet, c.url, nil)
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, c.url, nil)
 		if err != nil {
 			lastErr = "构建请求失败: " + err.Error()
 			continue
@@ -2156,6 +2234,7 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 		}
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 		resp.Body.Close()
+		lastCode = resp.StatusCode
 		if resp.StatusCode != http.StatusOK {
 			lastErr = fmt.Sprintf("API 返回 %d: %s", resp.StatusCode, string(body[:min(len(body), 512)]))
 			continue
@@ -2170,26 +2249,21 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 			lastErr = "解析响应失败: " + err.Error()
 			continue
 		}
-		models := make([]string, 0, len(parsed.Data))
+		models = make([]string, 0, len(parsed.Data))
 		for _, m := range parsed.Data {
 			if m.ID != "" {
 				models = append(models, m.ID)
 			}
 		}
 		if len(models) > 0 {
-			writeJSON(w, 200, map[string]any{"ok": true, "models": models})
-			return
+			return models, lastCode, ""
 		}
 		emptyOK = true // 200 but no model ids — keep trying other candidates
 	}
 	if emptyOK {
-		writeJSON(w, 200, map[string]any{"ok": true, "models": []string{}})
-		return
+		return nil, lastCode, errAllEmpty
 	}
-	if lastErr == "" {
-		lastErr = "未获取到模型列表"
-	}
-	writeJSON(w, 200, map[string]any{"ok": false, "error": lastErr})
+	return nil, lastCode, lastErr
 }
 
 // --- prompt template helpers (Go text/template + catalog 白名单) ---

@@ -280,6 +280,34 @@ CREATE TABLE IF NOT EXISTS exploration_anchors (
 );
 CREATE INDEX IF NOT EXISTS idx_anchor_asset ON exploration_anchors(asset_id);
 
+-- intent_reflections: deterministic, per-intent terminal lessons (v0.4.100).
+-- Written by the engine when an intent reaches any terminal state; read by the
+-- planner/worker to avoid repeating a failed direction. Deliberately a table
+-- (not a new exploration node kind) to avoid widening the node kind/state
+-- constraints and UI surface.
+CREATE TABLE IF NOT EXISTS intent_reflections (
+    id               BIGSERIAL PRIMARY KEY,
+    exploration_id   BIGINT NOT NULL REFERENCES explorations(id) ON DELETE CASCADE,
+    intent_id        BIGINT NOT NULL REFERENCES exploration_nodes(id) ON DELETE CASCADE,
+    dimension        TEXT NOT NULL DEFAULT '',
+    terminal_state   TEXT NOT NULL DEFAULT '',
+    terminal_reason  TEXT NOT NULL DEFAULT '',
+    wrote_back       INT  NOT NULL DEFAULT 0,
+    tool_calls       INT  NOT NULL DEFAULT 0,
+    tool_errors      INT  NOT NULL DEFAULT 0,
+    success          BOOLEAN NOT NULL DEFAULT false,
+    hypothesis       TEXT NOT NULL DEFAULT '',
+    success_criteria TEXT NOT NULL DEFAULT '',
+    summary          TEXT NOT NULL DEFAULT '',
+    lesson           TEXT NOT NULL DEFAULT '',
+    asset_ids        JSONB NOT NULL DEFAULT '[]',
+    payload          JSONB NOT NULL DEFAULT '{}',
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_intent_reflections_intent ON intent_reflections(intent_id);
+CREATE INDEX IF NOT EXISTS idx_intent_reflections_exp ON intent_reflections(exploration_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_intent_reflections_dim ON intent_reflections(exploration_id, dimension, created_at DESC);
+
 -- task_constraints: operator-authored operation constraints (allow/deny) for a task.
 -- Extracted by the goals decomposer at round 0 (from goal/description), editable at
 -- runtime by the main agent + 总览「约束管理」. Injected into the planner/worker system
@@ -459,6 +487,60 @@ ALTER TABLE llm_profiles ADD  CONSTRAINT llm_profiles_retry_check CHECK (
     retry_connect_attempts >= -1 AND retry_empty_attempts >= -1 AND retry_stream_attempts >= -1
     AND retry_connect_interval_ms >= 0 AND retry_empty_interval_ms >= 0 AND retry_stream_interval_ms >= 0);
 
+-- 厂商预设来源（v0.4.91，#LLM 配置重构）：记录该配置来自 llmpresets 包的哪条
+-- 预设。仅展示/向导关联用途，不参与 provider 构建；'' = 手动配置或旧数据。
+ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS preset_id TEXT NOT NULL DEFAULT '';
+
+-- LLM 配置级独立提示词（v0.4.121）：本配置被 Agent 显式绑定（或开启「继承时
+-- 也生效」后实际被选中）时，作为一段纯文本附加到该 Agent 的 system prompt。
+-- '' = 未配置，历史行为逐字节不变。纯文本：不做 Go 模板渲染，{{.Var}} 原样保留。
+ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS prompt TEXT NOT NULL DEFAULT '';
+-- 装配位置：'' = 未配置（必须与 prompt='' 同时出现）；prepend/append/replace 三选。
+--   prepend = 正文最前；append = 正文+技能索引之后、代码硬尾巴之前；replace = 替换正文
+--   （技能索引与代码硬尾巴仍保留）。
+ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS prompt_mode TEXT NOT NULL DEFAULT '';
+-- 继承时也生效：false（默认）= 仅当本配置被 agents.llm_profile_id 显式绑定时注入；
+-- true = 当本配置作为任务链/全局默认被实际选中时也注入（会话 pin 始终视为显式）。
+ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS prompt_apply_inherited BOOLEAN NOT NULL DEFAULT false;
+-- 同 format：先删再建，保证每次启动幂等。
+ALTER TABLE llm_profiles DROP CONSTRAINT IF EXISTS llm_profiles_prompt_mode_check;
+ALTER TABLE llm_profiles ADD  CONSTRAINT llm_profiles_prompt_mode_check
+    CHECK (prompt_mode IN ('','prepend','append','replace'));
+ALTER TABLE llm_profiles DROP CONSTRAINT IF EXISTS llm_profiles_prompt_len_check;
+ALTER TABLE llm_profiles ADD  CONSTRAINT llm_profiles_prompt_len_check
+    CHECK (char_length(prompt) <= 8000);
+-- 二值等价：有正文必有模式，无正文必无模式，杜绝「存了字却不生效」的死状态。
+ALTER TABLE llm_profiles DROP CONSTRAINT IF EXISTS llm_profiles_prompt_pair_check;
+ALTER TABLE llm_profiles ADD  CONSTRAINT llm_profiles_prompt_pair_check
+    CHECK ((prompt = '') = (prompt_mode = ''));
+
+-- 资产 URL 结构指纹（v0.4.94 经验层）：64-bit simhash（路径段归一+参数名+title/长度
+-- 分桶），同 root_domain 下汉明距离近的 endpoint 归同簇，供变体分析找同类端点。
+ALTER TABLE assets ADD COLUMN IF NOT EXISTS simhash BIGINT NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS idx_assets_root_simhash ON assets(root_domain, type, simhash) WHERE simhash <> 0;
+
+-- Playbook 武器库（v0.4.94 经验层）：validator PASS 的 critical/high 上报自动沉淀
+-- 成功攻击链快照；同类目标（同技术栈/同根域）派意图时按 Top3 注入 planner 态势。
+CREATE TABLE IF NOT EXISTS playbooks (
+    id          BIGSERIAL PRIMARY KEY,
+    name        TEXT NOT NULL DEFAULT '',
+    key         TEXT NOT NULL DEFAULT '',
+    vulnclass   TEXT NOT NULL DEFAULT '',
+    severity    TEXT NOT NULL DEFAULT '',
+    root_domain TEXT NOT NULL DEFAULT '',
+    techs       TEXT[] NOT NULL DEFAULT '{}',
+    url_pattern TEXT NOT NULL DEFAULT '',
+    steps       JSONB NOT NULL DEFAULT '[]',
+    finding_id  BIGINT,
+    task_id     BIGINT,
+    used_count  INTEGER NOT NULL DEFAULT 1,
+    last_used_at TIMESTAMPTZ,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_playbooks_key ON playbooks(key, root_domain);
+CREATE INDEX IF NOT EXISTS idx_playbooks_tech ON playbooks USING gin(techs);
+
+
 -- 思考开关字段 thinking_type，从旧的单一 reasoning_effort 语义一次性拆分而来。
 -- schema.sql 每次启动都执行，故迁移必须只跑一次：仅当该列尚不存在时才回填，
 -- 否则每次启动都会把用户后来手动设的组合覆盖回去。旧 reasoning_effort 语义：
@@ -561,6 +643,36 @@ ALTER TABLE tasks ADD COLUMN IF NOT EXISTS queued_at TIMESTAMPTZ;
 -- 任务级目标登录凭据（v0.4.8）：worker 先登录再测；password/totp_secret 只在
 -- DB 内保存，任何 API 响应都脱敏（见 db/task_auth.go）。NULL=未配置。
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS auth_config JSONB;
+
+-- 任务级多角色测试凭据池（#24）：每个任务可配置 admin/user_a/user_b 等命名凭据。
+-- config 复用 TaskAuthConfig 的 DBValue 形态（含秘密；API DTO 只回 has_* 标记）。
+-- status: pending | ok | failed | locked；secret_hash 用于凭据变更后自动复位熔断。
+CREATE TABLE IF NOT EXISTS task_credentials (
+    id             BIGSERIAL PRIMARY KEY,
+    task_id        BIGINT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    role           TEXT NOT NULL,
+    config         JSONB NOT NULL DEFAULT '{}',
+    status         TEXT NOT NULL DEFAULT 'pending',
+    last_checked_at TIMESTAMPTZ,
+    last_error     TEXT NOT NULL DEFAULT '',
+    failure_count  INT NOT NULL DEFAULT 0,
+    locked_until   TIMESTAMPTZ,
+    secret_hash    TEXT NOT NULL DEFAULT '',
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT ck_task_credential_role CHECK (role ~ '^[A-Za-z][A-Za-z0-9_-]{0,31}$'),
+    CONSTRAINT ck_task_credential_status CHECK (status IN ('pending','ok','failed','locked')),
+    CONSTRAINT uq_task_credential_role UNIQUE (task_id, role)
+);
+CREATE INDEX IF NOT EXISTS idx_task_credentials_task ON task_credentials(task_id);
+-- 任务构建时出口回执（issue #39）：最近一次 Agent 装配时实际注入的出口配置快照。
+-- 写入端已完成脱敏（不含代理用户名/密码），只读派生数据；NULL=尚未构建或归档已作废。
+-- 刻意不进 taskCols/scanTask：任务列表热路径不需要解析它，读取走窄查询。
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS egress_snapshot JSONB;
+-- SRC/众测 program profile（v0.4.112）：任务级平台/handle/scope/excluded/RPS/允许扫描器/
+-- dry-run/allow_race。NULL=未配置（现有任务零行为变化）；写入端做长度与枚举校验，
+-- 不含凭据。读取走窄查询，不进 taskCols/scanTask 热路径。
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS program_profile JSONB;
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS queue_mode TEXT NOT NULL DEFAULT '';
 -- 暂停开始时间；补旧库。NULL=当前未处于暂停。恢复时按 (now-paused_at)
 -- 顺延 deadline_at，避免窗口外休眠消耗任务的有效运行预算。
@@ -897,6 +1009,13 @@ ALTER TABLE mcp_servers ADD CONSTRAINT mcp_servers_transport_check
     CHECK (transport IN ('stdio','http','sse'));
 -- 旧库补列(schema.sql 每次启动都会 Exec)。
 ALTER TABLE mcp_servers ADD COLUMN IF NOT EXISTS insecure BOOLEAN NOT NULL DEFAULT false;
+-- MCP 启动/手动健康检查结果（v0.4.107）：last_ok NULL = 从未检查；
+-- last_error 只存脱敏后的一行错误，tool_count 保留最近一次成功发现的工具数。
+ALTER TABLE mcp_servers ADD COLUMN IF NOT EXISTS last_check_at TIMESTAMPTZ;
+ALTER TABLE mcp_servers ADD COLUMN IF NOT EXISTS last_ok BOOLEAN;
+ALTER TABLE mcp_servers ADD COLUMN IF NOT EXISTS last_error TEXT;
+ALTER TABLE mcp_servers ADD COLUMN IF NOT EXISTS last_latency_ms INTEGER;
+ALTER TABLE mcp_servers ADD COLUMN IF NOT EXISTS tool_count INTEGER NOT NULL DEFAULT 0;
 DROP TRIGGER IF EXISTS trg_mcp_upd ON mcp_servers;
 CREATE TRIGGER trg_mcp_upd BEFORE UPDATE ON mcp_servers
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
@@ -1235,6 +1354,28 @@ CREATE TABLE IF NOT EXISTS finding_traffic_bindings (
 );
 CREATE INDEX IF NOT EXISTS idx_finding_traffic_order ON finding_traffic_bindings(finding_id, position, id);
 CREATE INDEX IF NOT EXISTS idx_finding_traffic_snapshot ON finding_traffic_bindings(snapshot_id);
+
+-- 确定性回归库（v0.4.119）：审计通过的 finding 自动沉淀一个可重放检查。
+-- 不存请求头/正文（可能含凭据）：只存流量 ID，检查时从 traffic store 取；
+-- 流量被清理后检查返回 not_replayable，不隐式重建。
+CREATE TABLE IF NOT EXISTS finding_regressions (
+    id                  BIGSERIAL PRIMARY KEY,
+    finding_id          BIGINT NOT NULL UNIQUE REFERENCES findings(id) ON DELETE CASCADE,
+    task_id             BIGINT REFERENCES tasks(id) ON DELETE CASCADE,
+    vulnclass           TEXT NOT NULL DEFAULT '',
+    baseline_traffic_id TEXT NOT NULL DEFAULT '',
+    proof_traffic_id    TEXT NOT NULL DEFAULT '',
+    method              TEXT NOT NULL DEFAULT '',
+    url                 TEXT NOT NULL DEFAULT '',
+    assertion           TEXT NOT NULL DEFAULT 'status', -- status|token|diff
+    expected_status     INTEGER NOT NULL DEFAULT 0,
+    token               TEXT NOT NULL DEFAULT '',
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_checked_at     TIMESTAMPTZ,
+    last_verdict        TEXT NOT NULL DEFAULT '',
+    last_note           TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_finding_regressions_task ON finding_regressions(task_id);
 
 -- =====================================================================
 -- M. 后端日志持久化
@@ -1621,3 +1762,31 @@ CREATE TABLE IF NOT EXISTS credential_access_log (
     at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_credential_audit ON credential_access_log(credential_id, at DESC);
+
+-- LLM 选路转跳审计（llm_switch / llm_failover）按任务取历史时走偏索引：
+-- activity 上没有 kind 过滤，跨任务汇总在大会话上会退化为全表扫描。
+CREATE INDEX IF NOT EXISTS idx_act_llm_kind ON activity(exploration_id, id)
+    WHERE kind IN ('llm_switch','llm_failover');
+
+-- ============================================================================
+-- Agent × LLM 配置的 reasoning effort 覆盖（v0.4.121）
+-- effort 原本只属于 llm_profiles.reasoning_effort：同一个 Agent 想换个强度就得
+-- 复制整份配置。本表把「强度」从「配置」里解耦，(agent_key, profile_id) 命中时
+-- 优先于该配置自身的 reasoning_effort；空值不落库（清除覆盖 = 删除该行）。
+-- 只影响请求参数，不改变模型选择、故障转移与配额；故障转移到另一配置时按
+-- (该 Agent, 目标配置) 重新解析，不沿用上一配置的覆盖。
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS agent_profile_effort_overrides (
+    agent_key        TEXT NOT NULL REFERENCES agents(key) ON DELETE CASCADE,
+    profile_id       BIGINT NOT NULL REFERENCES llm_profiles(id) ON DELETE CASCADE,
+    reasoning_effort TEXT NOT NULL,
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (agent_key, profile_id)
+);
+CREATE INDEX IF NOT EXISTS idx_apeo_profile ON agent_profile_effort_overrides(profile_id);
+-- 只接受运行时认识的五个档位；空值不落库（清除覆盖 = 删除该行）。
+ALTER TABLE agent_profile_effort_overrides
+    DROP CONSTRAINT IF EXISTS agent_profile_effort_overrides_effort_check;
+ALTER TABLE agent_profile_effort_overrides
+    ADD CONSTRAINT agent_profile_effort_overrides_effort_check
+    CHECK (reasoning_effort IN ('low','medium','high','xhigh','max'));

@@ -11,10 +11,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/chu0119/pojun/agent"
-	"github.com/chu0119/pojun/db"
 	"github.com/Autumn-27/norma/harness"
 	"github.com/Autumn-27/norma/llm"
+	"github.com/chu0119/pojun/agent"
+	"github.com/chu0119/pojun/db"
 )
 
 type scriptedLLMProvider struct {
@@ -694,7 +694,7 @@ func TestProfileDeleteRestoresQuotaBlockedIntentWhenFallbackAvailable(t *testing
 		m:             m,
 		llmOn:         true,
 		llmProv:       &scriptedLLMProvider{},
-		provByProfile: map[int64]*provEntry{},
+		provByProfile: map[provKey]*provEntry{},
 	}
 	s.restoreTasksAfterProfileDelete(m.pg)
 

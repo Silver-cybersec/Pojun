@@ -329,6 +329,15 @@ func (s *ExplorationStore) SetNodeState(id int64, state string) error {
 // token，有实测依据），但那本质是"声称达成"而不是"被证据证明"。把区别写进
 // payload 的合并字段里，报告与界面才能如实呈现，而不是让一次偷懒的收官看起来
 // 和验证过的达成一样。
+// MergeGoalPayload 合并字段进 goal 节点的 payload（jsonb ||，v0.4.96 proof 落库用）。
+func (s *ExplorationStore) MergeGoalPayload(id int64, fields map[string]any) error {
+	raw, _ := json.Marshal(fields)
+	_, err := s.db.Exec(`UPDATE exploration_nodes
+SET payload = COALESCE(payload,'{}'::jsonb) || $1::jsonb
+WHERE id=$2 AND exploration_id=$3 AND kind='goal'`, string(raw), id, s.expID)
+	return err
+}
+
 func (s *ExplorationStore) MarkGoalUnverified(id int64, reason string) error {
 	raw, _ := json.Marshal(map[string]any{
 		"unverified":        true,
@@ -1839,9 +1848,34 @@ type ActivitySessionFilter struct {
 	NodeID  *int64
 	Main    bool // main-agent session
 	MainSeg *int // segment for the main session (nil == current, resolved by caller; 0 == original)
+	// Kinds restricts rows to the listed activity kinds. Empty keeps the historical
+	// behaviour (no kind filter), so existing session pagination is byte-identical.
+	Kinds []string
 }
 
 func (f ActivitySessionFilter) cond(argStart int) (string, []any) {
+	clause, args := f.sessionCond(argStart)
+	if len(f.Kinds) > 0 {
+		// The LLM-route history filter is the only caller that must use the
+		// partial index idx_act_llm_kind. A parameter array (kind=ANY($n)) cannot
+		// be proven to satisfy a constant partial-index predicate, so emit the
+		// literal list for exactly that pair; every other filter stays generic.
+		if len(f.Kinds) == 2 && isLLMRouteKinds(f.Kinds) {
+			clause += " AND kind IN ('llm_switch','llm_failover')"
+		} else {
+			args = append(args, f.Kinds)
+			clause += fmt.Sprintf(" AND kind=ANY($%d)", argStart+len(args)-1)
+		}
+	}
+	return clause, args
+}
+
+func isLLMRouteKinds(kinds []string) bool {
+	a, b := kinds[0], kinds[1]
+	return (a == "llm_switch" && b == "llm_failover") || (a == "llm_failover" && b == "llm_switch")
+}
+
+func (f ActivitySessionFilter) sessionCond(argStart int) (string, []any) {
 	switch {
 	case f.NodeID != nil:
 		return fmt.Sprintf(" AND node_id=$%d", argStart), []any{*f.NodeID}

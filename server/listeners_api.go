@@ -1,5 +1,5 @@
 // 回连接收器 REST API：列出/启动/停止/查会话。授权面与全部业务 API 一致
-//（JWT）；启停的 agent 侧审批由拦截规则「[内置] 启停回连接收器」（ask）负责。
+// （JWT）；启停的 agent 侧审批由拦截规则「[内置] 启停回连接收器」（ask）负责。
 package server
 
 import (

@@ -67,9 +67,9 @@ tags:
 func TestParseSkillTagsOptional(t *testing.T) {
 	dir := t.TempDir()
 	cases := map[string]string{
-		"无标签": "---\nname: a\ndescription: x\n---\nbody",
-		"无 frontmatter":  "# just a body",
-		"损坏的 YAML":     "---\nname: [broken\n---\nbody",
+		"无标签":           "---\nname: a\ndescription: x\n---\nbody",
+		"无 frontmatter": "# just a body",
+		"损坏的 YAML":      "---\nname: [broken\n---\nbody",
 		"文件不存在":         "",
 	}
 	for name, content := range cases {

@@ -19,6 +19,10 @@ type ArtifactRecorder interface {
 // ListTaskArtifacts 是 host 注入的附件列表读取（agent 工具用）。nil = 不可用。
 var ListTaskArtifacts func(taskID string) ([]db.TaskArtifact, error)
 
+// TaskArtifactQuota 是 host 注入的配额读取（#50）：list_artifacts 输出里带回
+// 已用/上限，让模型在 save_evidence 触顶前知道剩余空间、触顶后能如实上报。
+var TaskArtifactQuota func(taskID string) (count int, bytes int64, maxCount int, maxBytes int64)
+
 // FindingTaskID 由 host 注入：按漏洞 ID 反查所属任务（v0.4.20）。
 // reporter 的 chat 工具集没有任务上下文，靠模型传 finding_id 定位任务。
 var FindingTaskID func(findingID int64) (string, error)
@@ -67,7 +71,7 @@ func (t *ToolSet) saveEvidence() actool.CoreTool {
 	return writeTool("save_evidence",
 		"把工作目录里的证据文件登记为任务附件（截图 / 数据样本 / 日志 / HTML / JSON），随报告导出成证据包。证据原样保真、明文保留（不打码/不脱敏，第一方递交官方核验）；大数据集可整份登记（附件上限 300 件/500MB）。同一文件重复登记会去重。",
 		obj(map[string]any{
-			"path":       str("工作目录内的相对路径（如 shots/login-userlist.png）"),
+			"path":       str("相对当前运行目录的路径（如 shots/login-userlist.png）；允许用 .. 回到任务根（如 ../miniapp/<appid>/source/app-service.js），但不得越出任务目录"),
 			"name":       str("可选：展示名（含扩展名）；省略用文件名"),
 			"kind":       str("可选：image|data|log|html|auto（默认按扩展名推断）"),
 			"source_url": str("可选：采集来源 URL"),
@@ -106,7 +110,7 @@ func (t *ToolSet) saveEvidence() actool.CoreTool {
 // reporter 没有任务上下文，可传 finding_id 让工具反查所属任务（v0.4.20）。
 func (t *ToolSet) listArtifacts() actool.CoreTool {
 	return readTool("list_artifacts",
-		"列出本任务已登记的证据附件（id/名称/类型/大小/说明/来源）。撰写报告时用 ![图注](artifact:<id>) 把图片插进报告。reporter 可传 finding_id 以定位该漏洞所属任务的附件。",
+		"列出本任务已登记的证据附件（id/名称/类型/大小/说明/来源），并附配额（已用/上限）。save_evidence 触顶后不要反复重试——把配额情况告诉操作员，由其在任务页删除旧附件或调高系统设置里的 artifact_max_count。撰写报告时用 ![图注](artifact:<id>) 把图片插进报告。reporter 可传 finding_id 以定位该漏洞所属任务的附件。",
 		obj(map[string]any{
 			"finding_id": map[string]any{"type": "integer", "description": "可选：当前漏洞 ID；reporter 用它定位所属任务的附件清单"},
 		}), func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
@@ -129,7 +133,12 @@ func (t *ToolSet) listArtifacts() actool.CoreTool {
 			if err != nil {
 				return actool.Errorf(err.Error()), nil
 			}
-			out, _ := json.Marshal(map[string]any{"artifacts": list})
+			payload := map[string]any{"artifacts": list}
+			if TaskArtifactQuota != nil && taskID > 0 {
+				qc, qb, qmc, qmb := TaskArtifactQuota(fmt.Sprint(taskID))
+				payload["quota"] = map[string]any{"count": qc, "bytes": qb, "max_count": qmc, "max_bytes": qmb}
+			}
+			out, _ := json.Marshal(payload)
 			return actool.Text(string(out)), nil
 		})
 }

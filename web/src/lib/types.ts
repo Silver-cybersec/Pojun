@@ -44,6 +44,133 @@ export interface Task {
   auth_config?: TaskAuthConfigView;
 }
 
+// ---- 任务出口回执（issue #39，只读快照） ----
+export type TaskEgressKind =
+  | "recording_proxy"
+  | "proxy_pool"
+  | "global_proxy"
+  | "direct"
+  | "strict_block";
+
+export interface TaskEgressEndpoint {
+  scheme?: string;
+  host?: string;
+  port?: string;
+  address?: string; // 已脱敏展示串：scheme://host[:port]
+  has_auth: boolean;
+  parse_ok: boolean;
+}
+
+export interface TaskEgressRoute extends TaskEgressEndpoint {
+  kind: TaskEgressKind;
+}
+
+export interface TaskEgressRole extends TaskEgressRoute {
+  role: string; // worker / planner / mainagent
+}
+
+export interface TaskEgressUpstream extends TaskEgressEndpoint {
+  kind: TaskEgressKind;
+  note?: string;
+}
+
+export interface TaskEgressCapture {
+  enabled: boolean; // settings.traffic_capture（构建时）
+  injected: boolean; // Agent 是否真的被注入记录代理地址
+  effective: boolean; // 记录代理是否在监听（running）
+  ca_present: boolean;
+  note?: string; // capture 边界说明（passthrough 不录制等）
+}
+
+export interface TaskEgressPool {
+  configured: boolean;
+  available: number;
+  strategy?: string;
+}
+
+export interface TaskEgressObserved {
+  known: boolean; // 构建期恒为 false
+  reason?: string;
+}
+
+export interface TaskEgressUASurface {
+  id: string;
+  scope: string; // native / shell / platform / external
+  class: "platform_fixed" | "runtime_default" | "tool_own" | string;
+  value?: string;
+  note?: string;
+  override?: string[];
+}
+
+export interface TaskEgressUA {
+  task_level_override: string; // none
+  observation: string; // declaration_only
+  note: string;
+  surfaces: TaskEgressUASurface[];
+}
+
+export interface TaskEgressPlatformSurface {
+  id: string;
+  scope: string; // platform / external
+  egress: string; // live_proxy_addr：每次调用实时解析
+  override?: string[];
+  note?: string;
+}
+
+export interface TaskEgressPlatform {
+  surfaces: TaskEgressPlatformSurface[];
+  note: string;
+}
+
+export interface TaskEgressSnapshot {
+  schema_version: number;
+  source: string;
+  captured_at: string;
+  build_version?: string;
+  capture: TaskEgressCapture;
+  strict_egress: boolean;
+  pool: TaskEgressPool;
+  upstream?: TaskEgressUpstream; // 仅捕获开：MITM 上游策略（声明，非实际 IP）
+  egress: TaskEgressRoute; // worker 的实际出口
+  roles: TaskEgressRole[];
+  roles_uniform: boolean;
+  observed: TaskEgressObserved;
+  platform_surfaces?: TaskEgressPlatform; // 旁路执行面：每次调用实时解析出口
+  ua: TaskEgressUA;
+}
+
+export interface TaskEgressResponse {
+  task_id: string;
+  built: boolean;
+  reason?: string;
+  compatible?: boolean; // false = 快照格式本端无法理解（不解包）
+  schema_version?: number;
+  snapshot?: TaskEgressSnapshot;
+}
+
+// ---- SRC/众测 program profile（v0.4.112，任务级） ----
+export interface ProgramProfile {
+  platform?: string; // hackerone/bugcrowd/intigriti/yeswehack/other
+  handle?: string;
+  scope?: string[];
+  excluded?: string[];
+  scanners_allowed?: string[];
+  allow_race?: boolean;
+  dry_run?: boolean;
+  rps?: number; // 0/缺省 = 不限速
+  allowed_hosts?: string[]; // 原生 HTTP allowlist；空=不限
+  denied_hosts?: string[]; // deny 优先
+  window_start?: string; // HH:MM
+  window_end?: string;
+  timezone?: string; // IANA
+  max_concurrent?: number; // 0=不限
+}
+
+export interface TaskProgramProfileResponse {
+  task_id: string;
+  profile: ProgramProfile | null;
+}
+
 export interface TaskCategory {
   id: number;
   name: string;
@@ -670,6 +797,9 @@ export interface LLMAuditProfile {
   name: string;
   format: string;
   model: string;
+  /** 生效强度与该角色维度上的来源（未记录时缺省，禁止用当前覆盖回填历史）。 */
+  effort?: string;
+  effort_source?: "override" | "profile" | "unset";
 }
 
 export interface LLMTransition {
@@ -687,6 +817,8 @@ export interface TaskLLMResolution {
   source: "task_chain" | "agent_binding" | "global_profile" | "environment" | "global";
   available: boolean;
   reason?: string;
+  effort?: string;
+  effort_source?: "override" | "profile" | "unset";
 }
 
 export interface TaskLLMResolutions {
@@ -887,7 +1019,9 @@ export interface TaskAuthConfigView {
   username_field?: string;
   password_field?: string;
   username?: string;
+  auth_mode?: string;
   has_password?: boolean;
+  has_token?: boolean;
   has_totp?: boolean;
   extra_fields?: Record<string, string>;
   headers?: Record<string, string>;
@@ -904,6 +1038,47 @@ export interface AuthCheckResult {
   elapsed_ms: number;
   used_totp?: boolean;
   checked_at: string;
+}
+
+// 任务级多角色凭据（#24）的只读视图：秘密字段永不返回，只回 has_* 标记。
+export interface TaskCredential {
+  id: number;
+  role: string;
+  enabled: boolean;
+  login_url: string;
+  method: string;
+  auth_mode: string;
+  content_type: string;
+  username_field?: string;
+  password_field?: string;
+  username?: string;
+  has_password: boolean;
+  has_token: boolean;
+  has_totp: boolean;
+  extra_fields?: Record<string, string>;
+  headers?: Record<string, string>;
+  success_status?: number;
+  success_contains?: string;
+  status: "pending" | "ok" | "failed" | "locked" | string;
+  last_checked_at?: string;
+  last_error?: string;
+  failure_count: number;
+  locked_until?: string;
+}
+
+export interface TaskCredentialCheck {
+  result: AuthCheckResult;
+  credential: TaskCredential;
+}
+
+// 创建/编辑多角色凭据的输入；password/token/totp_secret 只写不读。
+export interface TaskCredentialInput {
+  role: string;
+  config: TaskAuthConfigView & {
+    password?: string;
+    token?: string;
+    totp_secret?: string;
+  };
 }
 
 // 单任务成本估算（GET /api/tokens/cost?task=）。金额按内置参考价换算，
@@ -1013,9 +1188,35 @@ export interface TrafficHost {
   count: number;
 }
 
+// ---- 流量保留策略（未引用流量 TTL） ----
+export interface TrafficRetentionStatus {
+  days: number;
+  enabled: boolean;
+  cutoff: number; // unix seconds；0 = 未开启
+  total: number;
+  candidates: number;
+  protected: number;
+  deletable: number;
+}
+
+export interface TrafficRetentionResult {
+  dry_run: boolean;
+  days: number;
+  cutoff: number;
+  candidates: number;
+  protected: number;
+  deletable: number;
+  deleted?: number;
+  legacy_dirs?: number;
+  blob_reclaimed?: boolean;
+}
+
 // ---- App settings (runtime toggles) ----
 export interface Settings {
+  artifact_max_count?: number; // #45/#50 证据附件每任务件数上限（生效值）
+  artifact_max_bytes?: number; // 证据附件每任务总字节上限（生效值）
   traffic_capture: boolean;
+  traffic_retention_days?: number; // 未引用流量 TTL；0=关闭
   agent_traffic_binding: boolean; // Agent 自动绑定流量证据，默认关闭；不影响人工绑定
   llm_record: boolean; // LLM 录制开关（默认关）；关闭时不记录任何 LLM 调用
   // Web search. brave_key_set / tavily_key_set reflect whether a key is stored
@@ -1059,7 +1260,14 @@ export interface Settings {
   auto_finish_max_rounds?: number; // 默认 80，0=不限
   // 意图级软预算（v0.4.28）：单意图累计 token 到顶注入收尾提醒（不杀进程）。
   intent_budget_enabled?: boolean; // 默认 true
-  intent_budget_tokens?: number; // 默认 3000000，范围 500000–20000000
+  intent_budget_tokens?: number;
+  intent_budget_minutes?: number; // v0.4.92 墙钟预算（0=关）
+  intent_budget_mode?: string;    // soft | hard // 默认 3000000，范围 500000–20000000
+  // 任务级预算（v0.4.101）：0=不限；80% 预警、100% 收尾。
+  task_budget_tokens?: number;
+  task_budget_usd?: number;
+  task_budget_minutes?: number;
+  task_budget_warn_pct?: number; // 默认 80，范围 50–95
   // 证据逐字回验（v0.4.29）：off=关闭 / warn=只提示（默认）/ block=critical/high 无出处打回。
   finding_evidence_verify?: "off" | "warn" | "block";
   // 工具输出注入告警（v0.4.29）：命中高精度注入特征时提醒模型「当数据不当指令」。
@@ -1195,6 +1403,67 @@ export interface LLMProfile {
   user_agent?: string;
   // 本配置对重试的覆盖（建连/空响应/同 provider 安全窗口）。留空/全 0 = 跟随全局策略。
   retry?: LLMRetryOverride;
+  // 厂商预设来源（llmpresets.ID）。空 = 手动配置或旧数据。
+  preset_id?: string;
+  // 独立提示词（v0.4.121）：纯文本；只在本配置被显式绑定到 Agent，或开启
+  // prompt_apply_inherited 后被任务链/全局选路选中时注入。空 = 未配置。
+  prompt?: string;
+  prompt_mode?: "prepend" | "append" | "replace" | "";
+  prompt_apply_inherited?: boolean;
+  // 反向引用：哪些 Agent 覆盖了本配置的思考强度（只读）。
+  effort_overrides?: { agent_key: string; reasoning_effort: string; updated_at?: string }[];
+}
+
+// ─── LLM 厂商知识层（v0.4.91 配置重构）───
+export interface LLMModelEntry {
+  id: string;
+  context_k: number;
+  reasoning?: boolean;
+  max_tokens?: number;
+  max_tokens_field?: string;
+  thinking_type?: string;
+  reasoning_effort?: string;
+  user_agent?: string;
+}
+export interface LLMPreset {
+  id: string;
+  name: string;
+  category: "official" | "aggregate" | "relay" | "local" | "custom";
+  format: "anthropic" | "openai" | "openai-responses";
+  base_url: string;
+  auth_note: string;
+  note: string;
+  models: LLMModelEntry[];
+  // 差异化 profile 参数预置（v0.4.93/96）：选预设即带入，空=无预置。
+  session_header_key?: string;
+  user_agent?: string;
+  max_tokens_field?: string;
+  max_tokens?: number;
+  thinking_type?: string;
+  reasoning_effort?: string;
+}
+export interface LLMModelMeta {
+  model: string;
+  context_k: number;
+  max_output_k?: number;
+  reasoning: boolean;
+  source: "meta" | "preset" | "none";
+}
+export interface LLMCheckResult {
+  ok: boolean;
+  status_class:
+    | "ok"
+    | "key_invalid"
+    | "path_or_format"
+    | "network"
+    | "server_error"
+    | "empty_list"
+    | "missing_key"
+    | "unknown";
+  error_human?: string;
+  error?: string;
+  models?: string[];
+  latency_ms?: number;
 }
 
 // ---- LLM 重试策略 ----
@@ -1234,6 +1503,8 @@ export interface LLMPoolMember {
   priority: number;
   active: boolean; // 是否为当前激活配置（恒为链首）
   excluded: boolean; // pool_exclude：不参与轮询
+  has_key?: boolean;
+  in_chain?: boolean; // 有 key 且（激活或未排除）才会被轮询
   state: "ok" | "degraded" | "tripped";
   fails: number;
   trips: number;
@@ -1307,6 +1578,95 @@ export interface AgentDetail {
   task_timeout_wrapup_max_turns_default?: number;
 }
 
+// ---- Agent 提示词全链路（只读） ----
+export interface PromptChainSegment {
+  key: string;
+  title: string;
+  kind: string;
+  source: string;
+  source_label: string;
+  editable: boolean;
+  gate?: string;
+  present: boolean;
+  available: boolean;
+  reason?: string;
+  order: number;
+  chars: number;
+  text: string;
+}
+
+export interface PromptChainLLM {
+  profile_id?: number | null;
+  name: string;
+  model: string;
+  format: string;
+  source: string;
+  source_label: string;
+  prompt_mode: string;
+  prompt_chars: number;
+  prompt_apply_inherited: boolean;
+  prompt_active: boolean;
+  effort?: string;
+  effort_source?: "override" | "profile" | "unset";
+}
+
+export interface PromptChainTool {
+  key: string;
+  description: string;
+  deferred: boolean;
+  gate?: string;
+}
+
+export interface PromptChainExcluded {
+  key: string;
+  reason: string;
+}
+
+export interface PromptChainTools {
+  builtin: PromptChainTool[];
+  custom: PromptChainTool[];
+  traffic: PromptChainTool[];
+  shell: PromptChainTool[];
+  deferred_names: string[];
+  excluded: PromptChainExcluded[];
+  total: number;
+}
+
+export interface PromptChainMCP {
+  id: number;
+  name: string;
+  transport: string;
+  enabled: boolean;
+  mode: "global" | "skill_gated" | "excluded";
+  skill: string;
+  health: "ok" | "failed" | "never_checked";
+  last_check_at?: string;
+  last_error?: string;
+  tool_count: number;
+  cache_stale: boolean;
+  tools: { name: string; description: string }[];
+}
+
+export interface PromptChainSkill {
+  name: string;
+  description: string;
+  in_index: boolean;
+  mcp_gated: string[];
+}
+
+export interface AgentPromptChain {
+  agent_key: string;
+  agent_kind: "builtin" | "custom";
+  llm: PromptChainLLM;
+  segments: PromptChainSegment[];
+  tools: PromptChainTools;
+  mcp: PromptChainMCP[];
+  skills: PromptChainSkill[];
+  totals: { segments: number; chars: number; est_tokens: number };
+  warnings: string[];
+  static_only: boolean;
+}
+
 // ---- MCP ----
 export interface MCPServer {
   id: number;
@@ -1319,6 +1679,46 @@ export interface MCPServer {
   enabled: boolean;
   insecure?: boolean; // http: skip TLS cert verification (self-signed servers)
   tools?: string[]; // mcp_tools_cache (names only, for the count)
+  // 健康检查（v0.4.107）：last_ok 为空 = 从未检查；last_error 已脱敏。
+  last_check_at?: string;
+  last_ok?: boolean | null;
+  last_error?: string;
+  last_latency_ms?: number;
+  tool_count?: number;
+}
+
+// ---- 确定性回归检查（v0.4.119） ----
+export interface FindingRegression {
+  id: string;
+  finding_id: string;
+  task_id?: string;
+  vulnclass: string;
+  baseline_traffic_id?: string;
+  proof_traffic_id: string;
+  method: string;
+  url: string;
+  assertion: "status" | "token" | "diff" | string;
+  expected_status: number;
+  token?: string;
+  created_at: string;
+  last_checked_at?: string;
+  last_verdict?: string;
+  last_note?: string;
+}
+
+export interface FindingRegressionResponse {
+  finding_id: string;
+  regression: FindingRegression | null;
+}
+
+export interface FindingRegressionCheck {
+  finding_id: string;
+  verdict: "pass" | "fail" | "inconclusive" | "not_replayable" | string;
+  note: string;
+  status: number;
+  matched: boolean;
+  assertion: string;
+  regression?: FindingRegression;
 }
 
 export interface MCPTool {
@@ -1773,9 +2173,9 @@ export interface HostTool {
   installable: boolean;
   purpose: string;
   install?: string;
-  kind: "apt" | "github" | "pip" | "manual";
+  kind: "apt" | "github" | "pip" | "script" | "manual";
   /** 攻击面分类，页面按它分组。 */
-  category: "network" | "dns" | "web" | "cred" | "code" | "pivot" | "oob" | "exploit" | "material" | "runtime" | "middleware" | "";
+  category: "network" | "dns" | "web" | "cred" | "code" | "pivot" | "oob" | "exploit" | "mobile" | "material" | "runtime" | "middleware" | "";
 }
 
 export type InstallSourcePreset = "" | "tencent" | "tuna";
@@ -2061,3 +2461,153 @@ export interface SSHProvider {
   started_at?: string;
 }
 
+
+
+// ---- Agent × LLM 配置的 effort 覆盖 ----
+export interface AgentEffortProfile {
+  profile_id: number;
+  name: string;
+  format: string;
+  model: string;
+  is_default: boolean;
+  has_key: boolean;
+  profile_effort: string;
+  effort: string;
+  source: "override" | "profile" | "unset";
+  updated_at?: string;
+}
+
+export interface AgentEffortOverrides {
+  agent_key: string;
+  overrides: { profile_id: number; reasoning_effort: string; updated_at?: string }[];
+  profiles: AgentEffortProfile[];
+}
+
+// ---- LLM 路由投影（只读） ----
+export type LLMRouteAvailability = "ok" | "missing_key" | "invalid_config";
+
+export interface LLMRouteProfile {
+  id: number;
+  name: string;
+  format: string;
+  model: string;
+  priority: number;
+  pool_exclude: boolean;
+  has_key: boolean;
+  availability: LLMRouteAvailability;
+  availability_reason?: string;
+  effort?: string;
+  effort_source?: "override" | "profile" | "unset";
+}
+
+export interface LLMRouteLayer {
+  layer: "pin" | "agent_binding" | "task_chain" | "global_profile" | "environment";
+  applies_to?: string;
+  hit: boolean;
+  profile?: LLMRouteProfile;
+  reason?: string;
+}
+
+export interface LLMRouteChainEntry {
+  profile_id: number;
+  position: number;
+  status: string;
+  is_cursor: boolean;
+  last_error?: string;
+  exhausted_at?: string;
+  profile?: LLMRouteProfile;
+}
+
+export interface LLMRoutePool {
+  enabled: boolean;
+  bind_fallback: boolean;
+  order: string;
+  wraps: string;
+  members: LLMPoolMember[];
+  note: string;
+}
+
+export interface LLMRoutePolicy {
+  trigger: string;
+  does_not_trigger: string;
+  advance_rule: string;
+  same_provider_retry: string;
+  pool_selection: string;
+}
+
+export interface LLMRouteTransition {
+  id: number;
+  task_id: string;
+  created_at: string;
+  kind: string;
+  mode: "automatic" | "manual" | "exhausted" | string;
+  reason?: string;
+  summary?: string;
+  is_error: boolean;
+  previous?: LLMAuditProfile;
+  next?: LLMAuditProfile;
+}
+
+export interface LLMRouteHistory {
+  scope: "task" | "recent_tasks" | string;
+  state: "ok" | "no_records" | "error";
+  error?: string;
+  items: LLMRouteTransition[];
+  has_more: boolean;
+  earliest_cursor?: number;
+  snapshot_cursor?: number;
+  retention_note?: string;
+}
+
+export interface LLMRouteRole {
+  agent_key: string;
+  source: string;
+  available: boolean;
+  availability?: LLMRouteAvailability;
+  reason?: string;
+  profile_id?: number;
+  name?: string;
+  format?: string;
+  model?: string;
+  effort?: string;
+  effort_source?: "override" | "profile" | "unset";
+}
+
+export interface LLMRouteTaskRef {
+  id: string;
+  name?: string;
+  status?: string;
+  created_at?: number;
+  failover_state?: string;
+  failover_reason?: string;
+}
+
+export interface LLMRouteLastUsed {
+  worker: string;
+  profile_name?: string;
+  model?: string;
+  status?: string;
+  at?: string;
+}
+
+export interface AgentLLMRoute {
+  scope: "task" | "static" | string;
+  agent: { key: string; name: string; kind: string; binding: number | null };
+  task?: LLMRouteTaskRef;
+  precedence: LLMRouteLayer[];
+  roles: Record<string, LLMRouteRole>;
+  chain: LLMRouteChainEntry[];
+  active_profile_id?: number;
+  failover_state?: string;
+  failover_reason?: string;
+  pool: LLMRoutePool;
+  failover_policy: LLMRoutePolicy;
+  history: LLMRouteHistory;
+  /** 来自 llm_usage 记账的“最近一次实际使用”；仅任务视图且该泳道有记录时存在。 */
+  last_used?: LLMRouteLastUsed;
+  /** last_used 的边界说明（后端生成，前端原样展示）。 */
+  history_note?: string;
+  tasks: LLMRouteTaskRef[];
+  observed_at: string;
+  warnings: string[];
+}

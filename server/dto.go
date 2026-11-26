@@ -196,15 +196,15 @@ type TaskNodeDTO struct {
 
 func taskNodeDTO(n *db.Node) TaskNodeDTO {
 	d := TaskNodeDTO{
-		ID:           i64s(n.ID),
-		Type:         n.Kind,
-		Payload:      rawString(n.Payload),
-		DeleteReason: n.DeleteReason,
+		ID:            i64s(n.ID),
+		Type:          n.Kind,
+		Payload:       rawString(n.Payload),
+		DeleteReason:  n.DeleteReason,
 		BlockedReason: n.BlockedReason,
-		Priority:     n.Priority,
-		State:        n.State,
-		Origin:       n.Origin,
-		TS:           rfc3339(n.CreatedAt),
+		Priority:      n.Priority,
+		State:         n.State,
+		Origin:        n.Origin,
+		TS:            rfc3339(n.CreatedAt),
 	}
 	if n.SourceTaskID > 0 {
 		d.SourceTaskID = i64s(n.SourceTaskID)
@@ -243,8 +243,8 @@ func goalDTO(n *db.Node) GoalDTO {
 		Unverified:       p.Unverified,
 		UnverifiedReason: p.UnverifiedReason,
 		State:            n.State,
-		Origin:    n.Origin,
-		TS:        rfc3339(n.CreatedAt),
+		Origin:           n.Origin,
+		TS:               rfc3339(n.CreatedAt),
 	}
 }
 
@@ -634,31 +634,46 @@ type LLMProfileDTO struct {
 	// 0=继承全局策略 | -1=关闭该层重试 | >0=次数；interval_ms: 0=用默认指数退避 |
 	// >0=改用该固定毫秒间隔。全 0 = 完全跟随全局，即历史行为。
 	Retry db.RetryOverride `json:"retry"`
+	// 厂商预设来源（llmpresets.ID）。'' = 手动配置或旧数据；前端据此在编辑时
+	// 显示厂商标识。纯增量字段，旧客户端忽略。
+	PresetID string `json:"preset_id"`
+	// 独立提示词（v0.4.121）：纯文本，只在该配置被显式绑定到 Agent，或开启
+	// prompt_apply_inherited 后被任务链/全局选路选中时注入。'' = 未配置。
+	Prompt               string `json:"prompt"`
+	PromptMode           string `json:"prompt_mode"`
+	PromptApplyInherited bool   `json:"prompt_apply_inherited"`
+	// 反向引用：哪些 Agent 覆盖了本配置的思考强度（只读，来自 effort 覆盖表）。
+	EffortOverrides []db.AgentEffortRef `json:"effort_overrides,omitempty"`
 }
 
 func llmProfileDTO(p *db.LLMProfile) LLMProfileDTO {
 	return LLMProfileDTO{
-		ID:               i64s(p.ID),
-		Name:             p.Name,
-		Format:           p.Format,
-		BaseURL:          p.BaseURL,
-		Proxy:            p.Proxy,
-		Model:            p.Model,
-		APIKeyHint:       p.APIKeyHint,
-		RatePerSecond:    p.RatePerSecond,
-		RatePerMinute:    p.RatePerMinute,
-		ContextWindowK:   p.ContextWindowK,
-		ThinkingType:     p.ThinkingType,
-		ReasoningEffort:  p.ReasoningEffort,
-		IsDefault:        p.IsDefault,
-		Priority:         p.Priority,
-		PoolExclude:      p.PoolExclude,
-		Streaming:        p.Streaming,
-		MaxTokens:        p.MaxTokens,
-		MaxTokensField:   p.MaxTokensField,
-		SessionHeaderKey: p.SessionHeaderKey,
-		UserAgent:        p.UserAgent,
-		Retry:            p.Retry,
+		ID:                   i64s(p.ID),
+		Name:                 p.Name,
+		Format:               p.Format,
+		BaseURL:              p.BaseURL,
+		Proxy:                p.Proxy,
+		Model:                p.Model,
+		APIKeyHint:           p.APIKeyHint,
+		RatePerSecond:        p.RatePerSecond,
+		RatePerMinute:        p.RatePerMinute,
+		ContextWindowK:       p.ContextWindowK,
+		ThinkingType:         p.ThinkingType,
+		ReasoningEffort:      p.ReasoningEffort,
+		IsDefault:            p.IsDefault,
+		Priority:             p.Priority,
+		PoolExclude:          p.PoolExclude,
+		Streaming:            p.Streaming,
+		MaxTokens:            p.MaxTokens,
+		MaxTokensField:       p.MaxTokensField,
+		SessionHeaderKey:     p.SessionHeaderKey,
+		UserAgent:            p.UserAgent,
+		Retry:                p.Retry,
+		PresetID:             p.PresetID,
+		Prompt:               p.Prompt,
+		PromptMode:           p.PromptMode,
+		PromptApplyInherited: p.PromptApplyInherited,
+		EffortOverrides:      p.EffortOverrides,
 	}
 }
 

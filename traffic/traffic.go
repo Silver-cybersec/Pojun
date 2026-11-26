@@ -167,6 +167,13 @@ type Traffic struct {
 	// stopping() treats as "not closing".
 	closed    chan struct{}
 	closeOnce sync.Once
+	// running reports that Start has been entered and has not returned yet.
+	// go-mitmproxy does not expose the bound listener, so this is the closest
+	// honest liveness signal: a bind failure returns from Start immediately and
+	// clears it, while a live listener keeps Serve blocked until Close. Callers
+	// that display "recording is on" must read this instead of merely checking
+	// that a Traffic object exists.
+	running atomic.Bool
 	// pass is the set of hosts whose MITM interception failed for a proxy/protocol
 	// reason; connections to them are tunneled transparently (fail-open) so the
 	// request still reaches the target — unrecorded — instead of being killed.
@@ -355,6 +362,8 @@ func (t *Traffic) ProxyPoolEnabled() bool {
 // it, restoring direct dialing. The change is atomic and takes effect on the next
 // connection — no restart, no proxy rebuild. go-mitmproxy dials all three schemes
 // itself, so socks5 works uniformly here regardless of the target tool.
+// Validation failure leaves the previous value untouched (so a rejected global
+// proxy never silently becomes the effective downstream).
 func (t *Traffic) SetUpstreamProxy(raw string) error {
 	if strings.TrimSpace(raw) == "" {
 		t.upstream.Store(nil)
@@ -366,6 +375,19 @@ func (t *Traffic) SetUpstreamProxy(raw string) error {
 	}
 	t.upstream.Store(u)
 	return nil
+}
+
+// UpstreamProxy returns the global egress proxy the MITM actually holds, as a
+// URL string. Empty means direct dialing. This is the authoritative value for
+// "where captured traffic goes": a global proxy that failed validation when the
+// manager loaded it was never stored here, so reading the persisted setting
+// instead would misreport the effective upstream.
+func (t *Traffic) UpstreamProxy() string {
+	u := t.upstream.Load()
+	if u == nil {
+		return ""
+	}
+	return u.String()
 }
 
 // ValidateProxyURL parses and checks a proxy URL (http/https/socks5, optional
@@ -441,7 +463,20 @@ func (t *Traffic) CACertPath() string {
 }
 
 // Start runs the proxy (blocking); run in a goroutine.
-func (t *Traffic) Start() error { return t.proxy.Start() }
+func (t *Traffic) Start() error {
+	// Set before Start and cleared when it returns: Start only returns after a
+	// bind failure or after the server stops, so the flag stays true exactly
+	// while the listener is serving.
+	t.running.Store(true)
+	err := t.proxy.Start()
+	t.running.Store(false)
+	return err
+}
+
+// Running reports whether the recording proxy is currently serving (Start has
+// not returned). False means capture may be enabled in settings but the proxy
+// is not listening — nothing would actually be recorded.
+func (t *Traffic) Running() bool { return t.running.Load() }
 
 // Close waits for background tree reclamation to finish before closing the
 // index, so shutdown never leaves a goroutine unlinking files out from under a
@@ -451,6 +486,12 @@ func (t *Traffic) Start() error { return t.proxy.Start() }
 func (t *Traffic) Close() error {
 	if t.closed != nil {
 		t.closeOnce.Do(func() { close(t.closed) })
+	}
+	// Stop the listener first so Start returns and Running() goes false before
+	// the index is closed. Without this, shutdown would leave the proxy serving
+	// against a closed database.
+	if t.proxy != nil {
+		_ = t.proxy.Close()
 	}
 	t.reaping.Wait()
 	return t.db.Close()
@@ -784,10 +825,16 @@ func sanitize(s string) string {
 
 var blobHashRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
-// blobPath locates a stored blob. Current writes use one bucket level; blobs
-// written before that change used two, so both layouts are probed rather than
-// migrated.
-func (t *Traffic) blobPath(hash string) (string, error) {
+// blobPath locates a stored blob under this recorder's data directory.
+func (t *Traffic) blobPath(hash string) (string, error) { return blobPathIn(t.dir, hash) }
+
+// blobPathIn locates a stored blob under an arbitrary traffic directory. It is
+// shared with the offline identity scanner, which opens the index read-only and
+// must resolve blobs without constructing a Traffic (whose Open starts a proxy).
+//
+// Current writes use one bucket level; blobs written before that change used
+// two, so both layouts are probed rather than migrated.
+func blobPathIn(dir, hash string) (string, error) {
 	hash = strings.ToLower(strings.TrimSpace(hash))
 	// Validated as pure hex before touching the filesystem, so a crafted hash can
 	// never traverse out of the blob directory.
@@ -795,8 +842,8 @@ func (t *Traffic) blobPath(hash string) (string, error) {
 		return "", fmt.Errorf("非法的 blob hash")
 	}
 	for _, p := range []string{
-		filepath.Join(t.dir, "_blobs", "sha256", hash[:2], hash+".bin"),
-		filepath.Join(t.dir, "_blobs", "sha256", hash[:2], hash[2:4], hash+".bin"),
+		filepath.Join(dir, "_blobs", "sha256", hash[:2], hash+".bin"),
+		filepath.Join(dir, "_blobs", "sha256", hash[:2], hash[2:4], hash+".bin"),
 	} {
 		if st, err := os.Stat(p); err == nil && !st.IsDir() {
 			return p, nil

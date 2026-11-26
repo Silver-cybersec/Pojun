@@ -1,0 +1,182 @@
+{
+  "upstream": "https://github.com/chu0119/Pojun",
+  "default_branch": "main",
+  "commit_sha": "44a36480df29a2ea353c3ff5f4d3a7a1e759c046",
+  "commit_time_hkt": "2026-11-26 02:04:42",
+  "old_baseline_sha": "2230279b7e6eef1fdf2b008dda06664782e3b9c4",
+  "dynamic_verification": false,
+  "findings": [
+    {
+      "id": "PJ-H1",
+      "级别": "高",
+      "类别": "代码安全/隔离",
+      "路径": ["Dockerfile", "docker/docker-entrypoint.sh", "docker-compose.yml", "hostd/recipe.go", "agent/tools_jobs.go"],
+      "行号": ["Dockerfile:25", "Dockerfile:120-130", "docker/docker-entrypoint.sh:25-27", "docker-compose.yml:47-53", "hostd/recipe.go:5-8", "agent/tools_jobs.go:210-215"],
+      "commit_sha": "44a36480df29a2ea353c3ff5f4d3a7a1e759c046",
+      "证据链接": [
+        "https://github.com/chu0119/Pojun/blob/44a36480df29a2ea353c3ff5f4d3a7a1e759c046/Dockerfile#L25",
+        "https://github.com/chu0119/Pojun/blob/44a36480df29a2ea353c3ff5f4d3a7a1e759c046/Dockerfile#L130",
+        "https://github.com/chu0119/Pojun/blob/44a36480df29a2ea353c3ff5f4d3a7a1e759c046/docker/docker-entrypoint.sh#L25",
+        "https://github.com/chu0119/Pojun/blob/44a36480df29a2ea353c3ff5f4d3a7a1e759c046/docker-compose.yml#L50",
+        "https://github.com/chu0119/Pojun/blob/44a36480df29a2ea353c3ff5f4d3a7a1e759c046/agent/tools_jobs.go#L210"
+      ],
+      "确认状态": "已确认",
+      "描述": "镜像无 USER，入口以后台启动 root 权限的 pojun-hostd，再 exec 主进程。compose 把宿主机 ./data 与 ./skills 挂进容器。本树可见的后台作业用 bash -c 执行模型给出的命令，无命名空间、seccomp 或降权。控制台会话、被诱导的模型工具调用与容器 root 处于同一权限域，并可写回挂载目录。这是部署者/宿主机风险；产品本身需要执行授权测试命令，见主报告「故意能力」。",
+      "建议": "为运行用户单独建非 root 账户，把 hostd 的安装能力与 Agent 命令拆到不同权限；缩小挂载；默认拦截覆盖全部命令执行工具。"
+    },
+    {
+      "id": "PJ-M1",
+      "级别": "中",
+      "类别": "代码安全/权限闸门",
+      "路径": ["intercept/intercept.go", "agent/assembly.go", "agent/tools_jobs.go", "agent/wrapup.go", "server/assembly.go"],
+      "行号": ["intercept/intercept.go:162-169", "agent/assembly.go:87-93", "agent/tools_jobs.go:20-23", "agent/tools_jobs.go:142", "agent/wrapup.go:96-113", "server/assembly.go:477-489"],
+      "commit_sha": "44a36480df29a2ea353c3ff5f4d3a7a1e759c046",
+      "证据链接": [
+        "https://github.com/chu0119/Pojun/blob/44a36480df29a2ea353c3ff5f4d3a7a1e759c046/intercept/intercept.go#L162",
+        "https://github.com/chu0119/Pojun/blob/44a36480df29a2ea353c3ff5f4d3a7a1e759c046/agent/assembly.go#L87",
+        "https://github.com/chu0119/Pojun/blob/44a36480df29a2ea353c3ff5f4d3a7a1e759c046/agent/tools_jobs.go#L22"
+      ],
+      "确认状态": "已确认",
+      "描述": "未保存 intercept_enabled_tools 时，进入规则的工具名只有 11 个：Bash、WebFetch、web_search、shell_open、shell_send、listener_start、listener_stop、goal_met、Write、Edit、MultiEdit。本树已确认 job_start、run_script、http_request 会执行命令或发请求，且不在这 11 个名字里。local_exec 关闭时只摘掉 Bash/Write/Edit/MultiEdit/NotebookEdit 与 shell_* 前缀；tools_jobs.go 注释写 job_start 已登记进该表，表中没有 job_start。查不到 agent 行时 local_exec 按开启处理。收尾名单使用 shell_exec 等名字，拦截默认名单使用 shell_send；运行时 PTY 工具名在 Norma，本单未读，两套名字是否同时有效标未确认。",
+      "建议": "让默认拦截集、local_exec 摘除集与收尾隐藏集共用同一份执行工具名单，并加测试锁住 job_start/run_script。"
+    },
+    {
+      "id": "PJ-M2",
+      "级别": "中",
+      "类别": "代码安全/权限闸门",
+      "路径": ["db/intercept_builtin_rules.go", "intercept/intercept.go", "db/db.go"],
+      "行号": ["db/intercept_builtin_rules.go:107-114", "intercept/intercept.go:418-420", "intercept/intercept.go:603-621", "db/db.go:749-770"],
+      "commit_sha": "44a36480df29a2ea353c3ff5f4d3a7a1e759c046",
+      "证据链接": [
+        "https://github.com/chu0119/Pojun/blob/44a36480df29a2ea353c3ff5f4d3a7a1e759c046/db/intercept_builtin_rules.go#L107",
+        "https://github.com/chu0119/Pojun/blob/44a36480df29a2ea353c3ff5f4d3a7a1e759c046/intercept/intercept.go#L418",
+        "https://github.com/chu0119/Pojun/blob/44a36480df29a2ea353c3ff5f4d3a7a1e759c046/db/db.go#L764"
+      ],
+      "确认状态": "已确认",
+      "描述": "研判类内置规则的超时动作是 allow。规则声明了 timeout 时，模型失败或超时按该动作处理，覆盖全局默认。全局默认里，模型失败是 ask，人工审批超时是 allow（180 秒）。「启停回连接收器」有一次性迁移，把超时动作改成 allow、180 秒。操作员不在时，已命中研判规则的命令和回连启停会按放行结束。",
+      "建议": "破坏性规则与监听器启停在失败或超时时保持 deny 或 ask，不要默认 allow。"
+    },
+    {
+      "id": "PJ-M3",
+      "级别": "中",
+      "类别": "代码安全/暴露面",
+      "路径": ["listener/listener.go", "docker-compose.windows.yml", "docker-compose.macos.yml"],
+      "行号": ["listener/listener.go:29-34", "listener/listener.go:139", "docker-compose.windows.yml:30-32", "docker-compose.macos.yml:26-28"],
+      "commit_sha": "44a36480df29a2ea353c3ff5f4d3a7a1e759c046",
+      "证据链接": [
+        "https://github.com/chu0119/Pojun/blob/44a36480df29a2ea353c3ff5f4d3a7a1e759c046/listener/listener.go#L139",
+        "https://github.com/chu0119/Pojun/blob/44a36480df29a2ea353c3ff5f4d3a7a1e759c046/docker-compose.windows.yml#L32",
+        "https://github.com/chu0119/Pojun/blob/44a36480df29a2ea353c3ff5f4d3a7a1e759c046/docker-compose.macos.yml#L28"
+      ],
+      "确认状态": "已确认",
+      "描述": "回连接收器监听 :端口（所有接口），允许端口 1024–65535。注释写明按设计对外部开放，用于接回连。Windows 与 macOS compose 覆盖文件把 4444–4450 发布到宿主机所有接口。主 compose 默认不映射这段端口。审批超时见 PJ-M2。未做端口扫描。",
+      "建议": "监听默认绑回环或任务指定地址；平台覆盖文件的端口发布改为显式宿主 IP，而不是 0.0.0.0。"
+    },
+    {
+      "id": "PJ-M4",
+      "级别": "中",
+      "类别": "供应链",
+      "路径": ["Dockerfile", "docker/install-tools.sh", "docker-compose.yml", ".env.example"],
+      "行号": ["Dockerfile:21-23", "Dockerfile:53", "Dockerfile:75-87", "Dockerfile:114", "docker/install-tools.sh:63-83", "docker-compose.yml:9", "docker-compose.yml:26", ".env.example:2"],
+      "commit_sha": "44a36480df29a2ea353c3ff5f4d3a7a1e759c046",
+      "证据链接": [
+        "https://github.com/chu0119/Pojun/blob/44a36480df29a2ea353c3ff5f4d3a7a1e759c046/Dockerfile#L53",
+        "https://github.com/chu0119/Pojun/blob/44a36480df29a2ea353c3ff5f4d3a7a1e759c046/Dockerfile#L75",
+        "https://github.com/chu0119/Pojun/blob/44a36480df29a2ea353c3ff5f4d3a7a1e759c046/docker/install-tools.sh#L69",
+        "https://github.com/chu0119/Pojun/blob/44a36480df29a2ea353c3ff5f4d3a7a1e759c046/docker-compose.yml#L26"
+      ],
+      "确认状态": "已确认",
+      "描述": "镜像构建与工具安装从 GitHub latest、npm @latest、无版本 pip、NodeSource 管道脚本和浮动 tag 取得代码，多数无校验和，并以 root 执行或安装。compose 默认镜像 tag 为 latest，基础镜像无 digest。锁文件内的 OSV 结果见 PJ-L6 与 supply-chain.md。未拉取镜像层，不把未取回的字节写成无恶意。",
+      "建议": "钉 digest 或发布校验和；取消 @latest 与 releases/latest；NodeSource 脚本改为固定文件并校验。"
+    },
+    {
+      "id": "PJ-L1",
+      "级别": "低",
+      "类别": "代码安全/凭据",
+      "路径": ["db/task_auth.go", "db/task_credentials.go", "vault/vault.go"],
+      "行号": ["db/task_auth.go:39-53", "db/task_credentials.go:87-96", "vault/vault.go:1-8"],
+      "commit_sha": "44a36480df29a2ea353c3ff5f4d3a7a1e759c046",
+      "证据链接": [
+        "https://github.com/chu0119/Pojun/blob/44a36480df29a2ea353c3ff5f4d3a7a1e759c046/db/task_auth.go#L53",
+        "https://github.com/chu0119/Pojun/blob/44a36480df29a2ea353c3ff5f4d3a7a1e759c046/vault/vault.go#L4"
+      ],
+      "确认状态": "已确认",
+      "描述": "任务登录配置把 password、token、totp_secret 放进 JSON 再写入数据库。API 结构体用 json:\"-\" 避免回包，存储本身是明文 JSON。同仓库 vault 对另一类凭据使用 XChaCha20-Poly1305，密钥文件 vault.key 权限 0600。compose 的 Postgres 未映射宿主机端口。本单不抄录任何口令。",
+      "建议": "任务登录秘密与 vault 使用同一套加密后再入库。"
+    },
+    {
+      "id": "PJ-L2",
+      "级别": "低",
+      "类别": "代码安全/认证",
+      "路径": ["server/auth.go"],
+      "行号": ["server/auth.go:122", "server/auth.go:544-580"],
+      "commit_sha": "44a36480df29a2ea353c3ff5f4d3a7a1e759c046",
+      "证据链接": [
+        "https://github.com/chu0119/Pojun/blob/44a36480df29a2ea353c3ff5f4d3a7a1e759c046/server/auth.go#L122",
+        "https://github.com/chu0119/Pojun/blob/44a36480df29a2ea353c3ff5f4d3a7a1e759c046/server/auth.go#L544"
+      ],
+      "确认状态": "已确认",
+      "描述": "clientIP 无条件采用 X-Forwarded-For 或 X-Real-IP 的客户端提供值。v0.4.96 起，全局锁期间仍做口令校验：正确口令会清锁并登录，错误口令返回 429 且不再延长全局锁。每 IP 锁仍在校验前生效。默认监听已是回环，远程攻击者默认够不着；一旦直接暴露且客户端能伪造转发头，全局锁不再构成尝试次数上限。失败路径仍有约 300ms 延迟。",
+      "建议": "只在确认反向代理覆盖该头时才信任转发头；全局锁期间拒绝继续校验口令。"
+    },
+    {
+      "id": "PJ-L3",
+      "级别": "低",
+      "类别": "代码安全/授权边界",
+      "路径": ["agent/tools.go", "db/task_scope_guard.go"],
+      "行号": ["agent/tools.go:2404-2420", "db/task_scope_guard.go:72-74"],
+      "commit_sha": "44a36480df29a2ea353c3ff5f4d3a7a1e759c046",
+      "证据链接": [
+        "https://github.com/chu0119/Pojun/blob/44a36480df29a2ea353c3ff5f4d3a7a1e759c046/agent/tools.go#L2413"
+      ],
+      "确认状态": "已确认",
+      "描述": "资产写回闸门在分类查询失败时返回空串，调用继续。该闸门只看 fact/finding 的 asset_ids，不检查 shell 命令的目标。查询成功时，foreign 资产拒绝写入。",
+      "建议": "分类查询失败时拒绝写回；命令执行另做目标约束，不能只靠提示词。"
+    },
+    {
+      "id": "PJ-L4",
+      "级别": "低",
+      "类别": "代码安全/会话",
+      "路径": ["web/src/lib/auth.ts"],
+      "行号": ["web/src/lib/auth.ts:20-23"],
+      "commit_sha": "44a36480df29a2ea353c3ff5f4d3a7a1e759c046",
+      "证据链接": [
+        "https://github.com/chu0119/Pojun/blob/44a36480df29a2ea353c3ff5f4d3a7a1e759c046/web/src/lib/auth.ts#L20"
+      ],
+      "确认状态": "已确认",
+      "描述": "登录令牌同时写入 localStorage 与 cookie。cookie 为 SameSite=Lax，无 HttpOnly、无 Secure。脚本能读到令牌。令牌有效期 7 天（server/auth.go 的 jwtTTL）。",
+      "建议": "会话 cookie 设 HttpOnly；HTTPS 部署加 Secure；缩短控制台令牌寿命。"
+    },
+    {
+      "id": "PJ-L5",
+      "级别": "低",
+      "类别": "代码安全/暴露面",
+      "路径": ["start.sh", "cmd/pojun/main.go", "Dockerfile"],
+      "行号": ["start.sh:26-41", "cmd/pojun/main.go:39-42", "Dockerfile:126-130"],
+      "commit_sha": "44a36480df29a2ea353c3ff5f4d3a7a1e759c046",
+      "证据链接": [
+        "https://github.com/chu0119/Pojun/blob/44a36480df29a2ea353c3ff5f4d3a7a1e759c046/start.sh#L33",
+        "https://github.com/chu0119/Pojun/blob/44a36480df29a2ea353c3ff5f4d3a7a1e759c046/cmd/pojun/main.go#L42",
+        "https://github.com/chu0119/Pojun/blob/44a36480df29a2ea353c3ff5f4d3a7a1e759c046/Dockerfile#L130"
+      ],
+      "确认状态": "已确认",
+      "描述": "裸二进制默认改为 127.0.0.1:8787。macOS 上若检测到旧 launchd plist 且参数没有 -addr，start.sh 会追加 -addr :8787，即所有接口。镜像 CMD 仍是 -addr :8787 -proxy :8788，容器内监听所有接口；主 compose 只把 8787/8788 发布到 127.0.0.1。流量代理构造参数未见访问认证（traffic/traffic.go Open）。docker-compose.bench.yml 使用 host 网络，其构建上下文被 gitignore，干净检出不能直接构建。",
+      "建议": "旧 plist 迁移到回环地址；不要为了兼容把所有接口绑回去。代理仅在需要录制时监听回环。"
+    },
+    {
+      "id": "PJ-L6",
+      "级别": "低",
+      "类别": "供应链",
+      "路径": ["go.mod", "go.sum", "web/package-lock.json"],
+      "行号": ["go.mod:6-22", "go.sum:13-14"],
+      "commit_sha": "44a36480df29a2ea353c3ff5f4d3a7a1e759c046",
+      "证据链接": [
+        "https://github.com/chu0119/Pojun/blob/44a36480df29a2ea353c3ff5f4d3a7a1e759c046/go.mod#L6",
+        "https://github.com/chu0119/Pojun/blob/44a36480df29a2ea353c3ff5f4d3a7a1e759c046/go.sum#L13"
+      ],
+      "确认状态": "已确认（公告命中）；可达性未确认",
+      "描述": "2026-11-26（香港时间）对本仓 go.sum 与两份 npm lock 共 959 个坐标做 OSV querybatch：0 条 MAL- 恶意包 ID，41 个坐标有漏洞公告。直接相关的 Go 公告包括 x/crypto ssh、x/net HTTP/2、klauspost/compress、gorilla/websocket、otel。未验证这些路径在本产品中是否可触发。镜像层与 Norma 源码未审，见 supply-chain.md「依赖是否恶意」。",
+      "建议": "按可达性筛选公告后再升级；把 Norma 纳入与本仓相同的审查范围。"
+    }
+  ]
+}

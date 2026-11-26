@@ -9,10 +9,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/chu0119/pojun/agent"
-	"github.com/chu0119/pojun/llmrec"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/transcript"
+	"github.com/chu0119/pojun/agent"
+	"github.com/chu0119/pojun/llmrec"
 )
 
 // Full chain against a real PG: Recorder → norma provider → capturing transport
